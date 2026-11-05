@@ -80,9 +80,18 @@ pub struct Attention {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
+    /// The machine it is on, empty for this one. A row keeps this itself, since the
+    /// sidebar can move to another machine while a menu or a prompt is open.
+    pub host: String,
     pub path: PathBuf,
     pub name: String,
     pub dir: bool,
+}
+
+impl Entry {
+    pub fn place(&self) -> crate::files::Place {
+        crate::files::Place::new(&self.host, &self.path)
+    }
 }
 
 /// What the daemon last said about everything outside this session.
@@ -318,16 +327,43 @@ pub fn read_dir(dir: &Path) -> Vec<Entry> {
         .flatten()
         .map(|e| {
             let path = e.path();
-            Entry { name: e.file_name().to_string_lossy().into_owned(), dir: path.is_dir(), path }
+            Entry { host: String::new(), name: e.file_name().to_string_lossy().into_owned(), dir: path.is_dir(), path }
         })
         .collect();
     found.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     let mut out = Vec::with_capacity(found.len() + 1);
     if let Some(parent) = dir.parent() {
-        out.push(Entry { path: parent.to_path_buf(), name: "..".to_string(), dir: true });
+        out.push(up_row("", parent));
     }
     out.extend(found);
     out
+}
+
+fn up_row(host: &str, parent: &Path) -> Entry {
+    Entry { host: host.to_string(), path: parent.to_path_buf(), name: "..".to_string(), dir: true }
+}
+
+/// The way back up from a folder that cannot be listed, so that it is not a dead end.
+pub fn rows_above(host: &str, dir: &Path) -> Vec<Entry> {
+    dir.parent().filter(|_| dir.is_absolute()).map(|parent| up_row(host, parent)).into_iter().collect()
+}
+
+/// A folder on another machine as `file-list` answers it: the folder it read,
+/// which `~` becomes, its rows, and whether more were left out.
+pub fn listing_rows(host: &str, answer: &Value) -> (PathBuf, Vec<Entry>, bool) {
+    let dir = PathBuf::from(text(answer, "dir"));
+    let up = answer["parent"].as_str().map(|parent| up_row(host, Path::new(parent)));
+    let rows = answer["entries"].as_array().into_iter().flatten().filter_map(|e| {
+        Some(Entry {
+            host: host.to_string(),
+            path: PathBuf::from(e["path"].as_str()?),
+            name: text(e, "name"),
+            // A link to a folder opens as a folder.
+            dir: e["kind"] == "dir" || e["link_kind"] == "dir",
+        })
+    });
+    let more = !answer["next"].is_null() || answer["capped"] == true;
+    (dir, up.into_iter().chain(rows).collect(), more)
 }
 
 /// `/a/b/c/d` as `…/c/d`, for a header with little room.
@@ -374,7 +410,7 @@ mod tests {
     }
 
     fn files() -> Vec<Entry> {
-        let e = |n: &str, dir| Entry { path: PathBuf::from(n), name: n.into(), dir };
+        let e = |n: &str, dir| Entry { host: String::new(), path: PathBuf::from(n), name: n.into(), dir };
         vec![e("..", true), e("src", true), e("Cargo.toml", false)]
     }
 

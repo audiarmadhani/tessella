@@ -4,7 +4,13 @@ use super::*;
 use gpui::{TextAlign, WrappedLine};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use tessella::files::Place;
 use tessella::markdown::{self, Block, Span};
+
+/// How often a far file is checked for changes. Each check crosses the link.
+const FAR_DOC_EVERY: Duration = Duration::from_secs(3);
+/// How long a far answer may stay away before another is asked for.
+const FAR_DOC_PATIENCE: Duration = Duration::from_secs(15);
 
 /// A line of text that holds links, to find them under a click.
 pub(super) struct LinkHit {
@@ -16,9 +22,13 @@ pub(super) struct LinkHit {
 
 /// A Markdown file on show.
 pub(super) struct MdDoc {
-    path: PathBuf,
+    place: Place,
     blocks: Rc<Vec<Block>>,
     changed: Option<SystemTime>,
+    /// When a file on another machine last changed, as that machine says.
+    far_stamp: Option<i64>,
+    /// A far answer is on its way.
+    far_asked: Option<Instant>,
     checked: Instant,
     pub scroll: f32,
     /// The furthest it can scroll, known once it has been drawn.
@@ -35,35 +45,48 @@ pub(super) struct DocDraw {
     links: Rc<RefCell<Vec<LinkHit>>>,
 }
 
+fn note(text: String) -> Vec<Block> {
+    vec![Block::Paragraph(vec![Span { text, ..Default::default() }])]
+}
+
 fn read(path: &Path) -> (Vec<Block>, Option<SystemTime>) {
     let changed = std::fs::metadata(path).and_then(|m| m.modified()).ok();
     match std::fs::read_to_string(path) {
         Ok(text) => (markdown::parse(&text), changed),
-        Err(err) => (vec![Block::Paragraph(vec![Span { text: format!("Could not read {}: {err}", path.display()), ..Default::default() }])], changed),
+        Err(err) => (note(format!("Could not read {}: {err}", path.display())), changed),
     }
 }
 
 impl Tessella {
     /// Keeps a document for each Markdown pane, and reloads a file that changed.
     pub(super) fn refresh_docs(&mut self, cx: &mut Context<Self>) {
-        let wanted: Vec<(String, PathBuf)> = self.state.windows.iter().filter_map(|w| Some((w.id.clone(), w.markdown_path()?))).collect();
+        let wanted: Vec<(String, Place)> = self.state.windows.iter().filter_map(|w| Some((w.id.clone(), w.markdown_place()?))).collect();
         self.docs.retain(|id, _| wanted.iter().any(|(w, _)| w == id));
-        for (id, path) in wanted {
-            match self.docs.get_mut(&id) {
-                Some(doc) if doc.checked.elapsed() >= Duration::from_secs(1) => {
-                    doc.checked = Instant::now();
-                    if std::fs::metadata(&path).and_then(|m| m.modified()).ok() != doc.changed {
-                        let (blocks, changed) = read(&path);
-                        doc.blocks = Rc::new(blocks);
-                        doc.changed = changed;
+        for (id, place) in wanted {
+            if let Some(doc) = self.docs.get_mut(&id) {
+                let every = if place.is_here() { Duration::from_secs(1) } else { FAR_DOC_EVERY };
+                if doc.checked.elapsed() < every {
+                    continue;
+                }
+                doc.checked = Instant::now();
+                if !place.is_here() {
+                    if doc.far_asked.is_none_or(|t| t.elapsed() >= FAR_DOC_PATIENCE) {
+                        doc.far_asked = Some(Instant::now());
+                        self.ask_doc_stamp(id, place);
                     }
+                } else if std::fs::metadata(&place.path).and_then(|m| m.modified()).ok() != doc.changed {
+                    let (blocks, changed) = read(&place.path);
+                    doc.blocks = Rc::new(blocks);
+                    doc.changed = changed;
                 }
-                Some(_) => {}
-                None => {
-                    let (blocks, changed) = read(&path);
-                    let doc = MdDoc { path, blocks: Rc::new(blocks), changed, checked: Instant::now(), scroll: 0.0, max_scroll: Rc::default(), links: Rc::default() };
-                    self.docs.insert(id, doc);
-                }
+                continue;
+            }
+            let (blocks, changed) = if place.is_here() { read(&place.path) } else { (note(format!("Reading {} from {}…", place.name(), place.host)), None) };
+            let far_asked = (!place.is_here()).then(Instant::now);
+            let doc = MdDoc { place: place.clone(), blocks: Rc::new(blocks), changed, far_stamp: None, far_asked, checked: Instant::now(), scroll: 0.0, max_scroll: Rc::default(), links: Rc::default() };
+            self.docs.insert(id.clone(), doc);
+            if !place.is_here() {
+                self.ask_doc_stamp(id, place);
             }
         }
         // An idle window does not redraw, and a file can change while it sits there.
@@ -77,6 +100,47 @@ impl Tessella {
                 });
             })
             .detach();
+        }
+    }
+
+    /// A far file's change time came back: it is read if that is new.
+    pub(super) fn doc_stamp_answered(&mut self, window: String, place: Place, result: &Value) {
+        let Some(doc) = self.docs.get_mut(&window) else { return };
+        let Some(stamp) = tessella::files::stat_stamp(result) else {
+            doc.far_asked = None;
+            doc.far_stamp = None;
+            doc.blocks = Rc::new(note(format!("{} is no longer on {}.", place.path.display(), place.host)));
+            return;
+        };
+        if doc.far_stamp == Some(stamp) {
+            doc.far_asked = None;
+            return;
+        }
+        self.ask_doc_text(window, &place, stamp);
+    }
+
+    pub(super) fn doc_text_answered(&mut self, window: &str, stamp: i64, result: &Value) {
+        use base64::Engine as _;
+        let Some(doc) = self.docs.get_mut(window) else { return };
+        doc.far_asked = None;
+        doc.far_stamp = Some(stamp);
+        let bytes = base64::engine::general_purpose::STANDARD.decode(result["content"].as_str().unwrap_or_default());
+        let mut blocks = match bytes {
+            Ok(bytes) => markdown::parse(&String::from_utf8_lossy(&bytes)),
+            Err(err) => note(format!("Could not read {}: {err}", doc.place.path.display())),
+        };
+        if result["eof"] == false {
+            blocks.extend(note("This file is longer than 4 MB, so only its start is here.".to_string()));
+        }
+        doc.blocks = Rc::new(blocks);
+    }
+
+    pub(super) fn doc_failed(&mut self, window: &str, error: &str) {
+        let Some(doc) = self.docs.get_mut(window) else { return };
+        doc.far_asked = None;
+        // A drop in the link leaves a file that was read on show.
+        if doc.far_stamp.is_none() {
+            doc.blocks = Rc::new(note(format!("Could not read {} from {}: {error}", doc.place.path.display(), doc.place.host)));
         }
     }
 
@@ -94,7 +158,7 @@ impl Tessella {
 
     /// A key on a focused Markdown pane. It says whether the pane took the key.
     pub(super) fn doc_key(&mut self, key: &str) -> bool {
-        let Some(id) = self.focused_win().filter(|w| w.markdown_path().is_some()).map(|w| w.id.clone()) else { return false };
+        let Some(id) = self.focused_win().filter(|w| w.markdown_place().is_some()).map(|w| w.id.clone()) else { return false };
         let page = ui(300.0);
         let line = ui(40.0);
         match key {
@@ -105,8 +169,8 @@ impl Tessella {
             "g" | "home" => self.scroll_doc(&id, f32::MIN),
             "G" | "end" => self.scroll_doc(&id, f32::MAX),
             "e" => {
-                if let Some(path) = self.docs.get(&id).map(|d| d.path.clone()) {
-                    self.edit_file(path);
+                if let Some(place) = self.docs.get(&id).map(|d| d.place.clone()) {
+                    self.edit_file(place);
                 }
             }
             _ => {}
@@ -126,14 +190,15 @@ impl Tessella {
             hit.links.iter().find(|(range, _)| range.contains(&index)).map(|(_, url)| url.clone())
         });
         let Some(target) = target else { return };
-        let base = doc.path.parent().map(Path::to_path_buf);
+        let host = doc.place.host.clone();
+        let base = doc.place.path.parent().map(Path::to_path_buf);
         if target.contains("://") || target.starts_with("mailto:") {
             cx.open_url(&target);
         } else if !target.starts_with('#') {
             // A path beside the file, without any #section after it.
             let relative = target.split('#').next().unwrap_or_default().to_string();
             if let Some(path) = base.map(|b| b.join(relative)) {
-                self.open_file(path);
+                self.open_file(Place::new(&host, path));
             }
         }
     }

@@ -121,7 +121,7 @@ impl Tessella {
                 self.press_header(&win, event, window);
                 return cx.notify();
             }
-            if win.markdown_path().is_some() {
+            if win.markdown_place().is_some() {
                 self.click_doc(&win.id, event.position, cx);
                 return cx.notify();
             }

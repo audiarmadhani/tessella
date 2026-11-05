@@ -291,7 +291,11 @@ impl Tessella {
                 }),
             )),
             RailSection::Files => {
-                let path = self.files_shown.as_deref().map(rail::short_path).unwrap_or_default();
+                let path = self.files_shown.as_ref().map(|shown| {
+                    let path = rail::short_path(&shown.path);
+                    if shown.is_here() { path } else { format!("{}:{path}", shown.host) }
+                });
+                let path = path.unwrap_or_default();
                 div()
                     .min_w_0()
                     .flex()
@@ -1027,6 +1031,12 @@ impl Tessella {
         let t = &self.theme;
         let line = theme::mix(t.palette.bg, t.text, 0.14);
         let confirm = matches!(p.kind, PromptKind::Confirm(_));
+        // What the button does, and whether a program stops because of it.
+        let (go, stops_programs) = match &p.kind {
+            PromptKind::Confirm(Confirm::Trash(_)) => ("Move  ⏎", false),
+            PromptKind::Confirm(Confirm::DeleteForever(_) | Confirm::DeleteLayout(_)) => ("Delete  ⏎", false),
+            _ => ("Close  ⏎", true),
+        };
         let danger = t.agent("errored").unwrap_or(t.accent);
         let hover = rgb(theme::mix(t.palette.bg, t.text, 0.08));
         let button = |label: &'static str| {
@@ -1053,7 +1063,7 @@ impl Tessella {
                     .text_color(rgb(t.text))
                     .child(SharedString::from(p.title.clone())),
             )
-            .when(confirm, |d| {
+            .when(confirm && stops_programs, |d| {
                 d.child(
                     div()
                         .px(px(18.0))
@@ -1112,7 +1122,7 @@ impl Tessella {
                                 ),
                         )
                         .child(
-                            button("Close  ⏎").bg(rgb(danger)).text_color(rgb(theme::on(danger))).on_mouse_down(
+                            button(go).bg(rgb(danger)).text_color(rgb(theme::on(danger))).on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();

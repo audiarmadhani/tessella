@@ -5416,6 +5416,7 @@ name = "tessella"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "base64",
  "futures",
  "gpui",
  "objc2",

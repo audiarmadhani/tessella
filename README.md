@@ -38,10 +38,10 @@ to set up. Tessella is an independent project, not part of tuios.
 | <img src="docs/assets/icon-agents.png" width="32" alt=""> | **Agents at a glance** | See every agent's state in the sidebar and the Agents tab, message them, and answer `tuios ask-human` questions with a click |
 | <img src="docs/assets/icon-inbox.png" width="32" alt=""> | **Inbox and mail** | Approvals, questions, errors and mail in one list, with mail to agents on your other machines |
 | <img src="docs/assets/icon-review.png" width="32" alt=""> | **Review** | Read what an agent changed, leave notes on lines, and send them back to it |
-| <img src="docs/assets/icon-files.png" width="32" alt=""> | **File manager** | Create, rename, copy, cut, paste, trash, search and send files from the sidebar, with a right-click menu |
-| <img src="docs/assets/icon-markdown.png" width="32" alt=""> | **Markdown panes** | `.md` files open rendered in a tiled pane, and reload when the file changes |
+| <img src="docs/assets/icon-files.png" width="32" alt=""> | **File manager** | Create, rename, copy, cut, paste, trash, search and send files from the sidebar, with a right-click menu, on this machine or another |
+| <img src="docs/assets/icon-markdown.png" width="32" alt=""> | **Markdown panes** | `.md` files open rendered in a tiled pane, from any machine, and reload when the file changes |
 | <img src="docs/assets/icon-keys.png" width="32" alt=""> | **Your keys** | Your tuios prefix and keybindings work as they are. Pause after the prefix and it shows what comes next |
-| <img src="docs/assets/icon-machines.png" width="32" alt=""> | **Other machines** | Open panes on any machine in your tuios `[hosts]` |
+| <img src="docs/assets/icon-machines.png" width="32" alt=""> | **Other machines** | Open panes on any machine in your tuios `[hosts]`, and browse, open and move its files from the sidebar |
 | <img src="docs/assets/icon-themes.png" width="32" alt=""> | **Themes** | Every tuios theme, with live preview and favourites, plus copy mode, a command palette and a settings window |
 
 ## Screenshots
@@ -170,7 +170,10 @@ is set to reduce motion.
 - Some things tuios draws itself are not here yet: hints, paste buffers, the transfers panel and tape
   recording. Their keys say so when pressed.
 - The scrolling layout cannot be panned yet, so columns fully off screen are hard to reach.
-- The file manager works on this machine, so a pane on another machine shows no files.
+- On another machine, tuios decides what the file manager may do. It can write only in that machine's
+  `files_roots`, which is `~/Downloads/tuios` by default, and tuios keeps keys and credentials out of reach.
+- Deleting a file on another machine is for good, since its Trash cannot be reached from here.
+- A new file on another machine needs its folder to exist already.
 - For an agent on another machine you can send mail. Its approvals and other actions are answered there.
 - Text input methods for languages such as Japanese are not supported yet.
 

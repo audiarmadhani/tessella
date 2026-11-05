@@ -1,7 +1,7 @@
 //! The sidebar's file manager: the same actions by key, by menu and by button.
 
 use super::*;
-use tessella::files::{self, Clip};
+use tessella::files::{self, Clip, Place};
 
 /// One row of a menu.
 #[derive(Debug, Clone)]
@@ -49,11 +49,14 @@ impl Tessella {
     pub(super) fn open_file_menu(&mut self, entry: Option<Entry>, at: Point<Pixels>) {
         let real = entry.as_ref().is_some_and(|e| e.name != "..");
         let folder = entry.as_ref().is_some_and(|e| e.dir);
+        let far = entry.as_ref().is_some_and(|e| !e.host.is_empty());
         let mut rows: Vec<MenuRow> = MENU
             .iter()
             .filter(|(_, action, _)| real || matches!(*action, "file_paste" | "file_create" | "file_search"))
             .filter(|(_, action, _)| *action != "file_paste" || self.file_clip.is_some())
             .filter(|(_, action, _)| *action != "file_edit" || !folder)
+            // The Trash belongs to this Mac, and tuios has no way to reach another's.
+            .filter(|(_, action, _)| *action != "file_delete" || !far)
             .map(|(label, action, group)| MenuRow {
                 label,
                 key: self.file_key(action),
@@ -100,22 +103,25 @@ impl Tessella {
             ("file_create", _, Some(dir)) => {
                 self.prompt(PromptKind::NewFile(dir), "New file, or a folder with a trailing /", String::new());
             }
-            ("file_paste", _, Some(dir)) => self.paste_into(dir),
+            ("file_paste", _, Some(dir)) => self.paste_into(dir, cx),
             ("file_search", _, Some(dir)) => self.open_file_search(dir),
-            ("file_edit", Some(e), _) if !e.dir => self.edit_file(e.path),
+            ("file_edit", Some(e), _) if !e.dir => self.edit_file(e.place()),
             ("file_open" | "file_edit", Some(e), _) => self.activate_row(Row::File(e), cx),
             ("file_rename", Some(e), _) => {
                 let title = format!("Rename {}", e.name);
-                self.prompt(PromptKind::RenameFile(e.path), &title, e.name);
+                self.prompt(PromptKind::RenameFile(e.place()), &title, e.name);
             }
             ("file_copy" | "file_cut", Some(e), _) => {
                 let cut = action == "file_cut";
                 self.status = Some(format!("{} {}. Paste it in another folder.", if cut { "Cut" } else { "Copied" }, e.name));
-                self.file_clip = Some(Clip { path: e.path, cut });
+                self.file_clip = Some(Clip { from: e.place(), cut });
             }
             ("file_copy_path", Some(e), _) => {
                 self.write_clipboard(e.path.to_string_lossy().into_owned(), cx);
                 self.status = Some(format!("Copied the path of {}.", e.name));
+            }
+            ("file_delete", Some(e), _) if !e.host.is_empty() => {
+                self.status = Some(format!("{} has no Trash from here. Use Delete for good.", e.host));
             }
             ("file_delete", Some(e), _) => {
                 let title = format!("Move {} to the Trash?", e.name);
@@ -123,9 +129,9 @@ impl Tessella {
             }
             ("file_delete_forever", Some(e), _) => {
                 let title = format!("Delete {} for good? This cannot be undone.", e.name);
-                self.prompt(PromptKind::Confirm(Confirm::DeleteForever(e.path)), &title, String::new());
+                self.prompt(PromptKind::Confirm(Confirm::DeleteForever(e.place())), &title, String::new());
             }
-            ("file_send", Some(e), _) => self.open_send_to(e.path),
+            ("file_send", Some(e), _) => self.open_send_to(e),
             _ => {}
         }
     }
@@ -133,75 +139,77 @@ impl Tessella {
     pub(super) fn files_changed(&mut self, result: std::io::Result<String>) {
         match result {
             Ok(message) => self.status = Some(message),
-            Err(err) => self.status = Some(err.to_string()),
+            Err(err) => self.status = Some(files::plain_error(&err.to_string())),
         }
         self.files_read = None;
+        self.forget_far_request();
     }
 
-    fn paste_into(&mut self, dir: PathBuf) {
+    fn paste_into(&mut self, dir: Place, cx: &mut Context<Self>) {
         let Some(clip) = self.file_clip.clone() else {
             self.status = Some("Nothing is copied yet.".into());
             return;
         };
-        let result = files::paste(&clip, &dir);
+        if !clip.from.is_here() || !dir.is_here() {
+            return self.far_paste(clip, dir, cx);
+        }
+        let result = files::paste(&clip, &dir.path);
         if result.is_ok() && clip.cut {
             self.file_clip = None;
         }
         self.files_changed(result.map(|to| format!("Pasted {}.", to.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()))));
     }
 
-    fn open_file_search(&mut self, dir: PathBuf) {
-        let items = files::walk(&dir).into_iter().map(|rel| {
-            let path = dir.join(&rel).to_string_lossy().into_owned();
+    fn open_file_search(&mut self, dir: Place) {
+        if !dir.is_here() {
+            return self.far_search(dir);
+        }
+        let items = files::walk(&dir.path).into_iter().map(|rel| {
+            let path = dir.path.join(&rel).to_string_lossy().into_owned();
             Item::new(rel, "", path)
         });
+        self.search_host = String::new();
         self.overlay = Overlay::Chooser(ChooserKind::FileSearch, Picker::new(items.collect(), String::new()));
     }
 
-    fn open_send_to(&mut self, path: PathBuf) {
-        let items: Vec<Item> = self
-            .machines
-            .iter()
-            .filter(|m| m.ready)
-            .filter_map(|m| m.host.clone())
-            .map(|host| Item::new(host.clone(), "", host))
-            .collect();
+    fn open_send_to(&mut self, entry: Entry) {
+        // A file on another machine can also come here.
+        let here = (!entry.host.is_empty()).then(|| Item::new("This machine", "", "local"));
+        let hosts = self.machines.iter().filter(|m| m.ready).filter_map(|m| m.host.clone()).filter(|host| *host != entry.host);
+        let items: Vec<Item> = here.into_iter().chain(hosts.map(|host| Item::new(host.clone(), "", host))).collect();
         if items.is_empty() {
             self.status = Some("No other machine is connected.".into());
             return;
         }
-        self.menu_entry = Some(Entry { name: String::new(), dir: path.is_dir(), path });
+        self.menu_entry = Some(entry);
         self.overlay = Overlay::Chooser(ChooserKind::SendTo, Picker::new(items, String::new()));
     }
 
-    /// Copies a path to a host's receive folder, with tuios's own copy.
-    pub(super) fn send_to(&mut self, path: PathBuf, host: String, cx: &mut Context<Self>) {
-        let name = path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-        self.status = Some(format!("Sending {name} to {host}…"));
-        let bin = std::env::var("TESSELLA_TUIOS_BIN").unwrap_or_else(|_| "tuios".to_string());
-        cx.spawn(async move |this, cx| {
-            let dest = format!("{host}:");
-            let run = cx
-                .background_executor()
-                .spawn(async move { std::process::Command::new(bin).arg("cp").arg(&path).arg(&dest).stdin(std::process::Stdio::null()).output() })
-                .await;
-            let message = match run {
-                Ok(out) if out.status.success() => format!("Sent {name} to {host}."),
-                Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                Err(err) => err.to_string(),
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.status = Some(message);
-                cx.notify();
-            });
-        })
-        .detach();
+    /// Copies a path to a machine's receive folder, with tuios's own copy.
+    pub(super) fn send_to(&mut self, from: Place, host: String, cx: &mut Context<Self>) {
+        let name = from.name();
+        let shown = if host == "local" { "this machine" } else { host.as_str() };
+        // `HOST:` is that machine's receive folder, and tuios has no such word for this one.
+        let to = if host == "local" {
+            let folder = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads/tuios");
+            if let Err(err) = std::fs::create_dir_all(&folder) {
+                self.status = Some(err.to_string());
+                return;
+            }
+            Place::new("", folder).folder_spec()
+        } else {
+            format!("{host}:")
+        };
+        self.status = Some(format!("Sending {name} to {shown}…"));
+        self.run_cp(vec![from.spec(), to], format!("Sent {name} to {shown}."), false, None, cx);
     }
 
     /// Opens what a search found: a file in a pane, a folder in the sidebar.
-    pub(super) fn open_found(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let dir = path.is_dir();
+    pub(super) fn open_found(&mut self, value: String, cx: &mut Context<Self>) {
+        let host = self.search_host.clone();
+        let dir = if host.is_empty() { Path::new(&value).is_dir() } else { value.ends_with('/') };
+        let path = PathBuf::from(value.trim_end_matches('/'));
         let name = path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-        self.activate_row(Row::File(Entry { path, name, dir }), cx);
+        self.activate_row(Row::File(Entry { host, path, name, dir }), cx);
     }
 }

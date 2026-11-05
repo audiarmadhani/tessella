@@ -116,8 +116,8 @@ pub struct Win {
 
 impl Win {
     /// The Markdown file this pane shows, if it is such a pane.
-    pub fn markdown_path(&self) -> Option<std::path::PathBuf> {
-        (self.kind == "view").then(|| crate::markdown::markdown_path(&self.uri)).flatten()
+    pub fn markdown_place(&self) -> Option<crate::files::Place> {
+        (self.kind == "view").then(|| crate::markdown::markdown_place(&self.uri)).flatten()
     }
 
     /// A short name for the pane. tuios's default title is a pane id, which

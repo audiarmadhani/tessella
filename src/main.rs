@@ -3,6 +3,7 @@
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use futures::StreamExt;
 mod agents_view;
+mod far_files;
 mod file_actions;
 mod md_view;
 mod settings_view;
@@ -165,7 +166,7 @@ enum Confirm {
     KillSession(String),
     DeleteLayout(String),
     Trash(PathBuf),
-    DeleteForever(PathBuf),
+    DeleteForever(tessella::files::Place),
 }
 
 #[derive(Debug, Clone)]
@@ -175,8 +176,8 @@ enum PromptKind {
     RenameSession,
     NewSession,
     SaveLayout,
-    NewFile(PathBuf),
-    RenameFile(PathBuf),
+    NewFile(tessella::files::Place),
+    RenameFile(tessella::files::Place),
     Confirm(Confirm),
 }
 
@@ -262,6 +263,7 @@ struct Slide {
 enum Reply {
     PanePreview(String),
     Agents(agents_view::AgentsReply),
+    Files(far_files::FileReply),
     /// A pane opened on another machine, to go beside this one.
     HostSplit { target: String, side: &'static str },
 }
@@ -390,9 +392,18 @@ struct Tessella {
     // The folder the files section shows, and for which pane it was chosen.
     files: Vec<Entry>,
     files_dir: Option<PathBuf>,
-    files_shown: Option<PathBuf>,
+    files_shown: Option<tessella::files::Place>,
     files_read: Option<Instant>,
     files_pane: String,
+    /// The folder asked for on another machine, which may be `~` until it answers.
+    files_want: Option<tessella::files::Place>,
+    files_asked: Option<Instant>,
+    /// Counts the far requests that have been superseded, to drop their answers.
+    files_request: u64,
+    files_error: Option<String>,
+    search_host: String,
+    /// The machine this whole window is attached to, with `--host`.
+    target_host: Option<String>,
 }
 
 impl Tessella {
@@ -520,6 +531,12 @@ impl Tessella {
             files_shown: None,
             files_read: None,
             files_pane: String::new(),
+            files_want: None,
+            files_asked: None,
+            files_request: 0,
+            files_error: None,
+            search_host: String::new(),
+            target_host: target.host.clone(),
         }
     }
 
@@ -794,7 +811,11 @@ impl Tessella {
                 let result = &event["verb_result"];
                 let reply = result["req"].as_i64().and_then(|req| self.replies.remove(&req));
                 if result["ok"] == false {
-                    self.status = result["error"].as_str().map(str::to_string);
+                    let error = result["error"].as_str().unwrap_or("That did not work.");
+                    match reply {
+                        Some(Reply::Files(reply)) => self.file_failed(reply, error, result["code"].as_str().unwrap_or_default()),
+                        _ => self.status = Some(error.to_string()),
+                    }
                 } else if let Some(reply) = reply {
                     self.verb_answered(reply, &result["result"]);
                 }
@@ -906,6 +927,7 @@ impl Tessella {
                 self.pane_preview = Some((value, lines));
             }
             Reply::Agents(reply) => self.agents_answered(reply, result),
+            Reply::Files(reply) => self.file_answered(reply, result),
             Reply::HostSplit { target, side } => {
                 if let Some(id) = result["window_id"].as_str() {
                     self.host_split = Some((id.to_string(), target, side));
@@ -1102,10 +1124,10 @@ impl Tessella {
             }
             ChooserKind::Launcher => self.send(json!({"cmd": "launch", "path": item.value})),
             ChooserKind::Layout => self.send(json!({"cmd": "layout-load", "name": item.value})),
-            ChooserKind::FileSearch => self.open_found(PathBuf::from(item.value), cx),
+            ChooserKind::FileSearch => self.open_found(item.value, cx),
             ChooserKind::SendTo => {
                 if let Some(entry) = self.menu_entry.take() {
-                    self.send_to(entry.path, item.value, cx);
+                    self.send_to(entry.place(), item.value, cx);
                 }
             }
         }
@@ -1171,7 +1193,7 @@ impl Tessella {
         self.overlay = Overlay::Prompt(Prompt { kind, title: title.to_string(), text, fresh });
     }
 
-    fn prompt_key(&mut self, k: &Keystroke) {
+    fn prompt_key(&mut self, k: &Keystroke, cx: &mut Context<Self>) {
         let Overlay::Prompt(p) = &mut self.overlay else { return };
         if let PromptKind::Confirm(what) = &p.kind {
             let what = what.clone();
@@ -1189,7 +1211,7 @@ impl Tessella {
             "escape" => self.overlay = Overlay::None,
             "enter" => {
                 let Overlay::Prompt(p) = std::mem::take(&mut self.overlay) else { return };
-                self.answered(p.kind, p.text.trim().to_string());
+                self.answered(p.kind, p.text.trim().to_string(), cx);
             }
             "backspace" => {
                 if std::mem::take(&mut p.fresh) {
@@ -1231,25 +1253,28 @@ impl Tessella {
                 };
                 self.files_changed(result);
             }
-            Confirm::DeleteForever(path) => {
-                let name = path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                self.files_changed(tessella::files::delete_forever(&path).map(|()| format!("Deleted {name}.")));
+            Confirm::DeleteForever(what) if !what.is_here() => self.far_delete(&what),
+            Confirm::DeleteForever(what) => {
+                let name = what.name();
+                self.files_changed(tessella::files::delete_forever(&what.path).map(|()| format!("Deleted {name}.")));
             }
         }
     }
 
-    fn answered(&mut self, kind: PromptKind, text: String) {
+    fn answered(&mut self, kind: PromptKind, text: String, cx: &mut Context<Self>) {
         let session = self.state.session.clone();
         match kind {
             PromptKind::RenameWindow(window) => self.verb("set-window", json!({"session": session, "window": window, "name": text})),
             PromptKind::RenameWorkspace(n) => self.verb("set-workspace-name", json!({"session": session, "workspace": n, "name": text})),
             PromptKind::RenameSession if !text.is_empty() => self.verb("rename-session", json!({"session": session, "name": text})),
+            PromptKind::NewFile(dir) if !dir.is_here() => self.far_new(&dir, &text, cx),
             PromptKind::NewFile(dir) => {
-                let made = tessella::files::create(&dir, &text);
+                let made = tessella::files::create(&dir.path, &text);
                 self.files_changed(made.map(|p| format!("Made {}.", p.display())));
             }
-            PromptKind::RenameFile(path) => {
-                let done = tessella::files::rename(&path, &text);
+            PromptKind::RenameFile(from) if !from.is_here() => self.far_rename(&from, &text),
+            PromptKind::RenameFile(from) => {
+                let done = tessella::files::rename(&from.path, &text);
                 self.files_changed(done.map(|p| format!("Renamed to {}.", p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()))));
             }
             PromptKind::SaveLayout if !text.is_empty() => {
@@ -1450,7 +1475,7 @@ impl Tessella {
     /// Opens the settings file in a new pane, making it first if needed.
     fn open_settings_file(&mut self) {
         match settings::ensure_file() {
-            Ok(path) => self.open_file(path),
+            Ok(path) => self.open_file(tessella::files::Place::new("", path)),
             Err(e) => self.status = Some(format!("Could not open the settings: {e}")),
         }
     }
@@ -1648,32 +1673,39 @@ impl Tessella {
                 self.refresh_files();
                 self.rail_cursor = rail::section_start(&self.rail_groups(), rail::Section::Files).unwrap_or(0);
             }
-            Row::File(e) => self.open_file(e.path),
+            Row::File(e) => self.open_file(e.place()),
         }
         cx.notify();
     }
 
     /// Opens a file in a new pane: Markdown drawn, and anything else in the editor.
-    fn open_file(&mut self, path: PathBuf) {
-        if !tessella::markdown::is_markdown(&path) {
-            return self.edit_file(path);
+    /// A Markdown pane is drawn here, wherever its file is.
+    fn open_file(&mut self, place: tessella::files::Place) {
+        if !tessella::markdown::is_markdown(&place.path) {
+            return self.edit_file(place);
         }
         let session = self.state.session.clone();
         let workspace = self.state.workspace;
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        let uri = tessella::markdown::file_uri(&path);
+        let name = place.name();
+        let uri = tessella::markdown::file_uri(&place);
         self.verb("new-window", json!({"session": session, "name": name, "workspace": workspace, "focus": true, "kind": "view", "uri": uri}));
         self.rail_focused = false;
     }
 
-    /// Opens a file in a new pane, in the person's editor.
-    fn edit_file(&mut self, path: PathBuf) {
+    /// Opens a file in a new pane, in the person's editor on the file's machine.
+    fn edit_file(&mut self, place: tessella::files::Place) {
         let session = self.state.session.clone();
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        let path = path.to_string_lossy().into_owned();
+        let name = place.name();
+        let path = place.path.to_string_lossy().into_owned();
         let workspace = self.state.workspace;
-        self.verb("new-window", json!({"session": session, "name": name, "workspace": workspace, "focus": true,
-            "command": ["sh", "-c", "exec ${EDITOR:-vi} \"$0\"", path]}));
+        let mut params = json!({"session": session, "name": name, "workspace": workspace, "focus": true,
+            "command": ["sh", "-c", "exec ${EDITOR:-vi} \"$0\"", path]});
+        if !place.is_here() {
+            params["host"] = json!(place.host);
+            // This machine's folders need not exist there.
+            params["cwd"] = json!(place.path.parent().unwrap_or(Path::new("~")).to_string_lossy());
+        }
+        self.verb("new-window", params);
         self.rail_focused = false;
     }
 
@@ -1681,6 +1713,10 @@ impl Tessella {
     fn cd_here(&mut self) {
         let Some(dir) = self.files_shown.clone() else { return };
         let Some(w) = self.focused_win().cloned() else { return };
+        if dir.host != self.files_host_of(&w) {
+            return;
+        }
+        let dir = dir.path;
         if !w.foreground.is_empty() {
             self.status = Some(format!("{} is running in this pane, so it would get the cd as input.", w.foreground));
             return;
@@ -1785,21 +1821,24 @@ impl Tessella {
             self.files_dir = None;
             self.files_read = None;
         }
-        if !w.host.is_empty() {
-            // The folder is on another machine, and this client reads only its own.
-            self.files.clear();
-            self.files_shown = None;
-            return;
+        let host = self.files_host_of(&w);
+        if !host.is_empty() {
+            // A pane that has not said where it is starts at its machine's home folder.
+            let doc_folder = w.markdown_place().filter(|doc| !doc.is_here()).and_then(|doc| doc.path.parent().map(Path::to_path_buf));
+            let dir = self.files_dir.clone().or(doc_folder).unwrap_or_else(|| PathBuf::from(if w.cwd.is_empty() { "~" } else { &w.cwd }));
+            return self.refresh_far_files(tessella::files::Place::new(&host, dir));
         }
         let Some(dir) = self.files_dir.clone().or_else(|| (!w.cwd.is_empty()).then(|| PathBuf::from(&w.cwd))) else {
             return;
         };
+        let place = tessella::files::Place::new("", dir);
         let fresh = self.files_read.is_some_and(|t| t.elapsed() < Duration::from_secs(3));
-        if self.files_shown.as_ref() == Some(&dir) && fresh {
+        if self.files_shown.as_ref() == Some(&place) && fresh {
             return;
         }
-        self.files = rail::read_dir(&dir);
-        self.files_shown = Some(dir);
+        self.files_want = None;
+        self.files = rail::read_dir(&place.path);
+        self.files_shown = Some(place);
         self.files_read = Some(Instant::now());
     }
 
@@ -1819,7 +1858,7 @@ impl Tessella {
                 return cx.notify();
             }
             Overlay::Prompt(_) => {
-                self.prompt_key(&k);
+                self.prompt_key(&k, cx);
                 return cx.notify();
             }
             Overlay::Settings(_) => {
@@ -1963,7 +2002,7 @@ impl Tessella {
     /// Scrolls the history. A full-screen program gets arrows, as a terminal sends.
     fn on_stage_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         let m = metrics(&self.look, window);
-        let doc = self.window_under(event.position, window).filter(|w| w.markdown_path().is_some()).map(|w| w.id.clone());
+        let doc = self.window_under(event.position, window).filter(|w| w.markdown_place().is_some()).map(|w| w.id.clone());
         if let Some(id) = doc {
             self.scroll_doc(&id, -f32::from(event.delta.pixel_delta(m.cell_h).y));
             return cx.notify();
@@ -2515,7 +2554,7 @@ impl Render for Tessella {
                 screen: self.panes.get(&w.pty).map(|p| p.screen(&palette)).unwrap_or_default(),
                 dx: if w.workspace == self.state.workspace { new_dx } else { old_dx },
                 rect: self.drawn_rect(w),
-                scrollbar: self.panes.get(&w.pty).and_then(Pane::scrollbar).filter(|_| w.markdown_path().is_none()),
+                scrollbar: self.panes.get(&w.pty).and_then(Pane::scrollbar).filter(|_| w.markdown_place().is_none()),
                 doc: self.doc_draw(&w.id),
                 badge: labels.iter().position(|id| *id == w.id).map(|i| i + 1),
                 fit: self.fit_for(w, slots, m),

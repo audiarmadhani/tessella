@@ -1,7 +1,8 @@
 //! Markdown as blocks to draw, and the file address of a pane that shows one.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use std::path::{Path, PathBuf};
+use crate::files::Place;
+use std::path::Path;
 
 /// A piece of text with one style.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -202,10 +203,9 @@ pub fn is_markdown(path: &Path) -> bool {
     })
 }
 
-/// The address of a file, for a pane that shows it.
-pub fn file_uri(path: &Path) -> String {
-    let mut out = String::from("file://");
-    for byte in path.to_string_lossy().bytes() {
+fn encode(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
         match byte {
             b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => out.push(byte as char),
             _ => out.push_str(&format!("%{byte:02X}")),
@@ -214,9 +214,8 @@ pub fn file_uri(path: &Path) -> String {
     out
 }
 
-/// The Markdown file a pane's address names, if it names one.
-pub fn markdown_path(uri: &str) -> Option<PathBuf> {
-    let encoded = uri.strip_prefix("file://")?.as_bytes();
+fn decode(text: &str) -> Option<String> {
+    let encoded = text.as_bytes();
     let mut bytes = Vec::with_capacity(encoded.len());
     let mut at = 0;
     while at < encoded.len() {
@@ -232,8 +231,21 @@ pub fn markdown_path(uri: &str) -> Option<PathBuf> {
             }
         }
     }
-    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
-    is_markdown(&path).then_some(path)
+    String::from_utf8(bytes).ok()
+}
+
+/// The address of a file, for a pane that shows it. A file on another machine has
+/// that machine in the address, as `file://m1/a.md`.
+pub fn file_uri(place: &Place) -> String {
+    format!("file://{}{}", encode(&place.host).replace('/', "%2F"), encode(&place.path.to_string_lossy()))
+}
+
+/// The Markdown file a pane's address names, if it names one.
+pub fn markdown_place(uri: &str) -> Option<Place> {
+    let rest = uri.strip_prefix("file://")?;
+    let (host, path) = rest.split_at(rest.find('/')?);
+    let place = Place::new(&decode(host)?, decode(path)?);
+    is_markdown(&place.path).then_some(place)
 }
 
 #[cfg(test)]
@@ -293,16 +305,19 @@ mod tests {
     #[test]
     fn a_file_address_goes_there_and_back_with_awkward_names() {
         let path = Path::new("/tmp/my notes #1/100%.md");
-        let uri = file_uri(path);
+        let uri = file_uri(&Place::new("", path));
         assert!(!uri.contains(' ') && !uri.contains('#'));
-        assert_eq!(markdown_path(&uri).as_deref(), Some(path));
+        assert_eq!(markdown_place(&uri), Some(Place::new("", path)));
+        let far = Place::new("m1", "/a b/c.md");
+        assert_eq!(file_uri(&far), "file://m1/a%20b/c.md");
+        assert_eq!(markdown_place(&file_uri(&far)), Some(far));
     }
 
     #[test]
     fn only_markdown_files_count() {
         assert!(is_markdown(Path::new("a.MD")));
         assert!(!is_markdown(Path::new("a.rs")));
-        assert_eq!(markdown_path("file:///a.txt"), None);
-        assert_eq!(markdown_path("tuios://review/x"), None);
+        assert_eq!(markdown_place("file:///a.txt"), None);
+        assert_eq!(markdown_place("tuios://review/x"), None);
     }
 }

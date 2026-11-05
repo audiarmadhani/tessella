@@ -26,7 +26,7 @@ Tessella is a window onto your tuios sessions. tuios still runs your terminals, 
 Tessella leaves them running, and your tuios keys, themes, hosts and scripts work with nothing
 to set up. Tessella is an independent project, not part of tuios.
 
-> **Early alpha.** Expect rough edges and missing pieces. It is tested with tuios 0.11.1, and it
+> **Early alpha.** Expect rough edges and missing pieces. It is tested with tuios 0.11.1 and 0.12.1, and it
 > talks to a hidden tuios command with no stability promise, so a tuios update can break it.
 
 ## Features
@@ -67,7 +67,16 @@ to set up. Tessella is an independent project, not part of tuios.
 
 ## Install
 
-You need macOS, [Rust](https://rustup.rs), and tuios. Tessella is tested with tuios 0.11.1.
+With [Homebrew](https://brew.sh), on macOS:
+
+```sh
+brew install audiarmadhani/tap/tessella
+```
+
+This builds Tessella from source and installs tuios if you do not have it. The first build takes a
+few minutes.
+
+Or build it yourself, with [Rust](https://rustup.rs) and tuios installed:
 
 ```sh
 git clone https://github.com/audiarmadhani/tessella
@@ -76,7 +85,9 @@ cargo build --release
 ./target/release/tessella
 ```
 
-To try it without touching your live sessions, run `scripts/try.sh`. It uses a private tuios
+Tessella is tested with tuios 0.11.1 and 0.12.1.
+
+From a clone, `scripts/try.sh` tries it without touching your live sessions. It uses a private tuios
 daemon with a copy of your tuios keys.
 
 Otherwise Tessella attaches to your running tuios daemon, to the last active session:

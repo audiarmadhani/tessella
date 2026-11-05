@@ -162,6 +162,14 @@ impl Pane {
     }
 
     #[cfg(test)]
+    fn all_text(&self) -> Vec<String> {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let rows = self.size().1 as i32;
+        (-history..rows).map(|y| (0..self.size().0).map(|x| grid[Line(y)][Column(x)].c).collect()).collect()
+    }
+
+    #[cfg(test)]
     fn text_lines_view(&self) -> String {
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
@@ -620,6 +628,37 @@ mod tests {
         assert!(pane.text_lines_view().starts_with("line 0"));
         pane.scroll_to_fraction(1.0);
         assert!((pane.scrollbar().unwrap().0 + height - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_survives_a_pane_narrowing_and_widening_again() {
+        let rows = ["/v1/sessions", "/v1/invoices", "/v1/search?q=acme", "/health", "/v1/webhooks/stripe", "/v1/users/me", "/v1/users/42", "/v1/invoices/981", "/v1/webhooks/stripe", "/v1/search?q=tile", "/v1/sessions/7", "/v1/users/me", "/health", "/v1/invoices"];
+        let plain: Vec<String> = rows.iter().enumerate().map(|(i, p)| format!("14:02:{i:02} GET    {p:24} 200 12ms")).collect();
+        let chains: [&[(u16, u16)]; 4] = [
+            &[(54, 17), (27, 18), (25, 16), (54, 17), (52, 15), (54, 17)],
+            &[(27, 18), (25, 16), (54, 16)],
+            &[(54, 17), (25, 16), (54, 16)],
+            &[(25, 16), (54, 17)],
+        ];
+        for chain in chains {
+            for snapshot_first in [false, true] {
+                let mut pane = if snapshot_first { Pane::new(111, 36) } else { Pane::new(54, 17) };
+                if snapshot_first {
+                    pane.resize(111, 36);
+                    pane.resize(54, 17);
+                }
+                for line in &plain {
+                    pane.feed(line.as_bytes());
+                    pane.feed(b"\r\n");
+                }
+                for (c, r) in chain {
+                    pane.resize(*c, *r);
+                }
+                let all = pane.all_text();
+                let found: Vec<String> = all.iter().map(|t| t.trim_end().to_string()).filter(|t| !t.is_empty()).collect();
+                assert_eq!(found, plain, "after {chain:?}, snapshot first {snapshot_first}");
+            }
+        }
     }
 
     #[test]

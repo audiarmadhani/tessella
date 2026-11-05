@@ -32,6 +32,7 @@ use tessella::rail::{self, Entry, Fleet, Filter, Group, Row};
 use tessella::settings::{self, Settings};
 use tessella::terminal::{Pane, Screen, SelectionType, Side};
 use tessella::theme::{self, Theme};
+use tessella::window_state::WindowState;
 
 /// Fonts to try with no family set. One font is used everywhere. These are Nerd
 /// Fonts first, for the icons that tuios, yazi and the like draw.
@@ -59,6 +60,14 @@ const FILE_SCOPE: &str = "sidebar.files";
 const PALETTE_ROW: &str = "palette:";
 /// How long to wait for tuios to answer a change of size.
 const SIZE_WAIT: Duration = Duration::from_millis(500);
+/// How long a new window size has to hold before panes resize for it, so that dragging
+/// an edge resizes them once and not on every step.
+const GRID_SETTLE: Duration = Duration::from_millis(120);
+/// How long the panes' saved state waits, so that a drag writes the file once.
+const STATE_SAVE_WAIT: Duration = Duration::from_millis(500);
+/// How long panes just brought on screen get to reach their size. A pane on another
+/// machine answers over the network.
+const FIT_HOLD: Duration = Duration::from_millis(700);
 /// How long the panes' grids have to agree before they are believed.
 const BORDER_SETTLE: Duration = Duration::from_millis(400);
 /// Room around all the panes, and around each pane inside its slot.
@@ -296,6 +305,16 @@ struct Tessella {
     agents_height: f32,
     /// Dragging the line above the agents section.
     agents_drag: bool,
+    /// A window size waiting to hold still, and since when.
+    grid_pending: Option<((u16, u16), Instant)>,
+    /// What was last saved for the next launch, and a save waiting to happen.
+    state_saved: Option<WindowState>,
+    state_save_due: Option<Instant>,
+    /// Panes just brought on screen may not have their size yet. Until this time their
+    /// text stays its size, rather than shrinking for a moment and growing back.
+    fit_hold: Option<Instant>,
+    /// A redraw for when the hold ends has yet to be asked for.
+    fit_wake: bool,
     /// The agents on other machines, and how each machine last answered.
     remote_agents: Vec<rail::Agent>,
     remote_hosts: Vec<tessella::agents::HostState>,
@@ -378,8 +397,12 @@ impl Tessella {
         let m = metrics(&look, window);
         let scale = window.scale_factor();
         let rail_space = if settings.sidebar.visible { ui(settings.sidebar.width) } else { 0.0 };
-        let grid = grid_for(m, window, rail_space, 1);
-        let b = match bridge::spawn(&target, bridge_grid(grid, m, scale, reserved(m, 1, (0, 0)))) {
+        // What the last run learned, so that the first size asked for is the right one.
+        let saved = WindowState::load();
+        let (gap, chrome, border) = saved.as_ref().map_or((1, (0, 0), (0, 0)), |s| (s.gap, s.chrome, s.border));
+        let grid = grid_for(m, window, rail_space, gap);
+        let reserve = reserved(m, gap, border);
+        let b = match bridge::spawn(&target, bridge_grid((grid.0 + chrome.0, grid.1 + chrome.1), m, scale, reserve)) {
             Ok(b) => b,
             Err(err) => {
                 eprintln!("tessella: {err}");
@@ -429,11 +452,16 @@ impl Tessella {
             asked_for_pane: false,
             grid,
             scale,
-            unused_chrome: (0, 0),
-            layout_gap: 1,
+            unused_chrome: chrome,
+            layout_gap: gap,
             settings_return: false,
             agents_height: settings.sidebar.agents_height,
             agents_drag: false,
+            grid_pending: None,
+            state_saved: None,
+            state_save_due: None,
+            fit_hold: None,
+            fit_wake: false,
             remote_agents: Vec::new(),
             remote_hosts: Vec::new(),
             remote_asked: None,
@@ -453,8 +481,8 @@ impl Tessella {
             mouse_down: None,
             device_scale: 1.0,
             size_sent: None,
-            reserved_sent: (0, 0),
-            pane_border: (0, 0),
+            reserved_sent: reserve,
+            pane_border: border,
             border_seen: None,
             size_checked: false,
             slide: None,
@@ -506,7 +534,13 @@ impl Tessella {
         });
         cx.spawn_in(window, async move |this, cx| {
             while let Some(word) = rx.next().await {
-                if let Some(at) = word.strip_prefix("rclick:") {
+                if let Some(at) = word.strip_prefix("frame:") {
+                    let n: Vec<f64> = at.split(',').filter_map(|v| v.parse().ok()).collect();
+                    if let [w, h] = n[..] {
+                        // SAFETY: as below.
+                        unsafe { tessella::native_input::resize_window(view, w, h) };
+                    }
+                } else if let Some(at) = word.strip_prefix("rclick:") {
                     let n: Vec<f64> = at.split(',').filter_map(|v| v.parse().ok()).collect();
                     if let [x, y] = n[..] {
                         // SAFETY: as below.
@@ -669,6 +703,8 @@ impl Tessella {
                     let same_session = self.state.session == state.session;
                     if same_session && self.state.workspace != state.workspace && self.state.workspace > 0 && self.animation().is_some() {
                         self.slide = Some(Slide { from: self.state.workspace, started: Instant::now() });
+                        self.fit_hold = Some(Instant::now() + FIT_HOLD);
+                        self.fit_wake = true;
                     }
                     if same_session {
                         self.start_layout_move(&state);
@@ -782,10 +818,11 @@ impl Tessella {
     /// the attach. After that a session follows the client in use, so another
     /// client taking it is not something to take back.
     fn sync_session_size(&mut self) {
-        let gap = self.state.layout_gap();
-        if gap != self.layout_gap {
-            self.layout_gap = gap;
-            self.scale = 0.0;
+        if let Some(gap) = self.state.layout_gap() {
+            if gap != self.layout_gap {
+                self.layout_gap = gap;
+                self.scale = 0.0;
+            }
         }
         if let Some(chrome) = self.state.unused_chrome() {
             if chrome != self.unused_chrome {
@@ -1835,7 +1872,7 @@ impl Tessella {
     /// The scale a pane's text is drawn at. Tiled panes on a workspace share the
     /// smallest, so that text stays one size across them. A popup has its own.
     fn fit_for(&self, win: &Win, s: Slots, m: Metrics) -> f32 {
-        if self.size_pending() || self.layout_move.is_some() {
+        if self.grid_pending.is_some() || self.size_pending() || self.layout_move.is_some() || self.fit_hold.is_some_and(|until| Instant::now() < until) {
             return 1.0;
         }
         let fit_of = |w: &Win| {
@@ -1925,7 +1962,14 @@ impl Tessella {
         let (w, h) = stage_size(window, ui(self.rail_drawn()));
         let b = self.state.layout_box();
         let (cols, rows) = if b.w > 0 && b.h > 0 { (b.w, b.h) } else { (self.grid.0 as i32, self.grid.1 as i32) };
-        let gap = self.state.layout_gap();
+        // With no tree anywhere, the box is the whole session: chrome tuios keeps out
+        // of it is still kept out, and panes are laid out without it.
+        let (cols, rows) = if self.state.trees.is_empty() {
+            ((cols - self.unused_chrome.0 as i32).max(1), (rows - self.unused_chrome.1 as i32).max(1))
+        } else {
+            (cols, rows)
+        };
+        let gap = self.layout_gap;
         Slots { w: w / (cols.max(1) + gap) as f32, h: h / (rows.max(1) + gap) as f32, x: b.x, y: b.y, gap }
     }
 
@@ -1991,6 +2035,45 @@ impl Tessella {
             && self.prefix_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(wait))
     }
 
+    /// Saves the window and what was learned once they have stopped changing.
+    fn save_window_state(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let (bounds, maximized, fullscreen) = match window.window_bounds() {
+            WindowBounds::Windowed(b) => (b, false, false),
+            WindowBounds::Maximized(b) => (b, true, false),
+            WindowBounds::Fullscreen(b) => (b, false, true),
+        };
+        let state = WindowState {
+            display: window.display(cx).map_or(0, |d| u32::from(d.id())),
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            w: f32::from(bounds.size.width),
+            h: f32::from(bounds.size.height),
+            maximized,
+            fullscreen,
+            font_size: self.look.size,
+            settings_font_size: self.settings.font.size,
+            gap: self.layout_gap,
+            chrome: self.unused_chrome,
+            border: self.pane_border,
+        };
+        if self.state_saved.as_ref() == Some(&state) {
+            self.state_save_due = None;
+            return;
+        }
+        match self.state_save_due {
+            Some(due) if Instant::now() >= due => {
+                state.save();
+                self.state_saved = Some(state);
+                self.state_save_due = None;
+            }
+            Some(_) => {}
+            None => {
+                self.state_save_due = Some(Instant::now() + STATE_SAVE_WAIT);
+                Self::wake_after(STATE_SAVE_WAIT + Duration::from_millis(10), cx);
+            }
+        }
+    }
+
     fn wake_after(wait: Duration, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
@@ -2012,7 +2095,8 @@ impl Tessella {
     /// depending on how the session was made. It shows in the panes' grids, and once
     /// they agree for a moment the insets give those cells back.
     fn measure_border(&mut self, cx: &mut Context<Self>) {
-        if self.size_pending() || self.reserved_sent == (0, 0) || self.state.session_size != self.state.client_size {
+        let holding = self.fit_hold.is_some_and(|until| Instant::now() < until);
+        if holding || self.grid_pending.is_some() || self.size_pending() || self.reserved_sent == (0, 0) || self.state.session_size != self.state.client_size {
             return;
         }
         let tiles = self.state.windows.iter().filter(|w| {
@@ -2050,8 +2134,22 @@ impl Tessella {
         let grid = grid_for(m, window, self.rail_space(), self.layout_gap);
         let scale = window.scale_factor();
         if grid == self.grid && scale == self.scale {
+            self.grid_pending = None;
             return;
         }
+        // Only a change of window size waits. A zoom or a new screen goes at once.
+        if scale == self.scale {
+            match self.grid_pending {
+                Some((waiting, since)) if waiting == grid && since.elapsed() >= GRID_SETTLE => {}
+                Some((waiting, _)) if waiting == grid => return,
+                _ => {
+                    self.grid_pending = Some((grid, Instant::now()));
+                    Self::wake_after(GRID_SETTLE + Duration::from_millis(10), cx);
+                    return;
+                }
+            }
+        }
+        self.grid_pending = None;
         self.grid = grid;
         self.scale = scale;
         // Ask for the box plus what tuios keeps out of it, so the panes fill the stage.
@@ -2324,6 +2422,10 @@ impl Render for Tessella {
         let m = metrics(&self.look, window);
         self.device_scale = window.scale_factor();
         self.viewport = (f32::from(window.viewport_size().width), f32::from(window.viewport_size().height));
+        if std::mem::take(&mut self.fit_wake) {
+            Self::wake_after(FIT_HOLD + Duration::from_millis(20), cx);
+        }
+        self.save_window_state(window, cx);
         self.refresh_docs(cx);
         self.refresh_remote_agents(cx);
         self.measure_border(cx);
@@ -2478,9 +2580,26 @@ fn main() {
         if background {
             eprintln!("tessella: font: {font}");
         }
-        set_ui_scale(settings.font.size);
-        let look = Look { font, size: settings.font.size };
-        let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
+        let saved = WindowState::load();
+        let font_size = saved.as_ref().and_then(|s| s.zoom(settings.font.size)).unwrap_or(settings.font.size);
+        set_ui_scale(font_size);
+        let look = Look { font, size: font_size };
+        // The window comes back where it was, if its screen is still there.
+        let display = saved.as_ref().and_then(|s| cx.displays().into_iter().find(|d| u32::from(d.id()) == s.display));
+        let window_bounds = match (&saved, &display) {
+            (Some(s), Some(_)) => {
+                let bounds = Bounds::new(point(px(s.x), px(s.y)), size(px(s.w), px(s.h)));
+                if s.fullscreen {
+                    WindowBounds::Fullscreen(bounds)
+                } else if s.maximized {
+                    WindowBounds::Maximized(bounds)
+                } else {
+                    WindowBounds::Windowed(bounds)
+                }
+            }
+            _ => WindowBounds::Windowed(Bounds::centered(None, size(px(1180.0), px(760.0)), cx)),
+        };
+        let display_id = display.map(|d| d.id());
         let titlebar = gpui::TitlebarOptions {
             title: Some("Tessella".into()),
             appears_transparent: true,
@@ -2488,7 +2607,8 @@ fn main() {
         };
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(window_bounds),
+                display_id,
                 titlebar: Some(titlebar),
                 window_background: WindowBackgroundAppearance::Blurred,
                 focus: !background,

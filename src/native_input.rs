@@ -68,6 +68,19 @@ pub fn trash(path: &std::path::Path) -> bool {
     }
 }
 
+/// Sets the window's size, keeping its top left, as a drag of an edge does.
+///
+/// # Safety
+/// As for `ns_window`.
+pub unsafe fn resize_window(view: usize, w: f64, h: f64) {
+    if let Some(window) = ns_window(view) {
+        let frame: NSRect = msg_send![&*window, frame];
+        let top = frame.origin.y + frame.size.height;
+        let next = NSRect::new(NSPoint::new(frame.origin.x, top - h), objc2_foundation::NSSize::new(w, h));
+        let _: () = msg_send![&*window, setFrame: next, display: true];
+    }
+}
+
 unsafe fn mouse(view: usize, kind: usize, x: f64, y: f64, clicks: isize) {
     mouse_with(view, kind, x, y, clicks, 0);
 }

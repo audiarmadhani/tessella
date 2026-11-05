@@ -591,7 +591,7 @@ impl Tessella {
     fn review_key(&mut self, name: &str) {
         let Some(page) = self.page() else { return };
         let Some(review) = page.review.as_mut() else {
-            if matches!(name, "escape" | "q") {
+            if matches!(name, "esc" | "escape" | "q") {
                 self.overlay = Overlay::None;
             }
             return;
@@ -599,7 +599,7 @@ impl Tessella {
         let count = review.files.get(review.file).map_or(0, |f| f.lines.len());
         let files = review.files.len();
         match name {
-            "escape" | "q" => self.overlay = Overlay::None,
+            "esc" | "escape" | "q" => self.overlay = Overlay::None,
             "j" | "down" => review.line = (review.line + 1).min(count.saturating_sub(1)),
             "k" | "up" => review.line = review.line.saturating_sub(1),
             "pagedown" | "J" => review.line = (review.line + 20).min(count.saturating_sub(1)),

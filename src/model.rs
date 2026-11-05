@@ -175,26 +175,32 @@ impl State {
             .unwrap_or(Rect { x: 0, y: 0, w: self.session_size.cols as i32, h: self.session_size.rows as i32 })
     }
 
-    /// The cells between neighbouring panes on this workspace.
-    pub fn layout_gap(&self) -> i32 {
+    /// The cells between neighbouring panes on this workspace, if anything on it says.
+    /// A workspace with one pane or none does not, and a guess would change as the
+    /// person moves between workspaces, and resize every pane each time.
+    pub fn layout_gap(&self) -> Option<i32> {
         if let Some(tree) = self.trees.get(&self.workspace.to_string()) {
-            return tree.gap.max(0);
+            return Some(tree.gap.max(0));
         }
         // A layout with no tree, such as the scrolling one, shows its gap in how far
-        // neighbouring panes sit apart. Another workspace's tree says nothing about it.
+        // neighbouring panes sit apart.
         let panes: Vec<&Win> = self.windows.iter().filter(|w| w.workspace == self.workspace && !w.minimized && !w.popup && !w.floating).collect();
-        gap_between(&panes).or_else(|| self.trees.values().next().map(|t| t.gap.max(0))).unwrap_or(1)
+        gap_between(&panes)
     }
 
     /// The columns and rows tuios keeps out of the box for chrome this client does
     /// not draw. None while another client sets the session's size, since that
-    /// client's chrome is its own to ask for.
+    /// client's chrome is its own to ask for, and on a workspace with no split tree,
+    /// which has no box to measure: it says nothing about the chrome.
     pub fn unused_chrome(&self) -> Option<(u16, u16)> {
         let (s, c) = (self.session_size, self.client_size);
         if s.cols == 0 || s != c {
             return None;
         }
-        let b = self.layout_box();
+        let b = self.trees.get(&self.workspace.to_string())?.bounds;
+        if b.w <= 0 || b.h <= 0 {
+            return None;
+        }
         Some(((s.cols as i32 - b.w).max(0) as u16, (s.rows as i32 - b.h).max(0) as u16))
     }
 
@@ -325,14 +331,24 @@ mod tests {
     #[test]
     fn a_layout_with_no_tree_reads_its_gap_from_where_its_panes_sit() {
         let win = |x, w| Win { workspace: 2, x, y: 0, w, h: 30, ..Default::default() };
-        let other_tree = Tree { gap: 0, ..Default::default() };
         let mut state = State { workspace: 2, windows: vec![win(0, 60), win(61, 60), win(122, 60)], ..Default::default() };
-        state.trees.insert("1".into(), other_tree);
-        assert_eq!(state.layout_gap(), 1, "columns one apart, whatever workspace 1 uses");
+        state.trees.insert("1".into(), Tree { gap: 0, ..Default::default() });
+        assert_eq!(state.layout_gap(), Some(1), "columns one apart, whatever workspace 1 uses");
         state.windows = vec![win(0, 60), win(60, 60)];
-        assert_eq!(state.layout_gap(), 0, "columns that touch");
-        state.windows = vec![win(0, 60)];
-        assert_eq!(state.layout_gap(), 0, "nothing to measure, so the other tree's");
+        assert_eq!(state.layout_gap(), Some(0), "columns that touch");
+    }
+
+    #[test]
+    fn a_workspace_that_says_nothing_about_the_layout_changes_nothing() {
+        let win = |workspace| Win { workspace, x: 0, y: 0, w: 60, h: 30, ..Default::default() };
+        let size = Size { cols: 242, rows: 59 };
+        let tree = Tree { gap: 0, bounds: Rect { x: 0, y: 0, w: 203, h: 59 }, ..Default::default() };
+        let mut state = State { workspace: 1, windows: vec![win(1), win(2)], session_size: size, client_size: size, ..Default::default() };
+        state.trees.insert("1".into(), tree);
+        assert_eq!((state.layout_gap(), state.unused_chrome()), (Some(0), Some((39, 0))));
+        // One pane and no tree of its own, as on a new workspace or a scrolling one.
+        state.workspace = 2;
+        assert_eq!((state.layout_gap(), state.unused_chrome()), (None, None));
     }
 
     #[test]

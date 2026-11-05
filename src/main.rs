@@ -262,6 +262,8 @@ struct Slide {
 enum Reply {
     PanePreview(String),
     Agents(agents_view::AgentsReply),
+    /// A pane opened on another machine, to go beside this one.
+    HostSplit { target: String, side: &'static str },
 }
 
 /// Panes moving to new places when the layout changes: a zoom, a split, a closed pane.
@@ -305,6 +307,8 @@ struct Tessella {
     agents_height: f32,
     /// Dragging the line above the agents section.
     agents_drag: bool,
+    /// A pane opened on another machine, its neighbour, and the side it goes on.
+    host_split: Option<(String, String, &'static str)>,
     /// A window size waiting to hold still, and since when.
     grid_pending: Option<((u16, u16), Instant)>,
     /// What was last saved for the next launch, and a save waiting to happen.
@@ -457,6 +461,7 @@ impl Tessella {
             settings_return: false,
             agents_height: settings.sidebar.agents_height,
             agents_drag: false,
+            host_split: None,
             grid_pending: None,
             state_saved: None,
             state_save_due: None,
@@ -712,6 +717,7 @@ impl Tessella {
                         self.layout_move = None;
                     }
                     self.state = state;
+                    self.place_host_split();
                     self.sync_session_size();
                     let live: Vec<&str> = self.state.windows.iter().map(|w| w.pty.as_str()).collect();
                     self.panes.retain(|pty, _| live.contains(&pty.as_str()));
@@ -900,6 +906,12 @@ impl Tessella {
                 self.pane_preview = Some((value, lines));
             }
             Reply::Agents(reply) => self.agents_answered(reply, result),
+            Reply::HostSplit { target, side } => {
+                if let Some(id) = result["window_id"].as_str() {
+                    self.host_split = Some((id.to_string(), target, side));
+                    self.place_host_split();
+                }
+            }
         }
     }
 
@@ -1268,6 +1280,29 @@ impl Tessella {
         }
     }
 
+    /// Opens a pane on the focused pane's machine. tuios's split opens one here, and
+    /// new-window takes a machine but not a place, so the new pane moves beside the
+    /// old one once it is in the layout. If the machine cannot open it, that is said,
+    /// and no pane opens here by mistake.
+    fn split_on_host(&mut self, win: Win, side: &'static str) {
+        let mut params = json!({"session": self.state.session, "host": win.host, "workspace": win.workspace, "focus": true});
+        if !win.cwd.is_empty() {
+            params["cwd"] = json!(win.cwd);
+        }
+        self.ask("new-window", params, Reply::HostSplit { target: win.id, side });
+    }
+
+    /// Moves a split's new pane beside its old one, once the layout holds it.
+    fn place_host_split(&mut self) {
+        let Some((id, target, side)) = self.host_split.clone() else { return };
+        let Some(win) = self.state.windows.iter().find(|w| w.id == id) else { return };
+        self.host_split = None;
+        // With no split tree, as in the scrolling layout, the layout places it.
+        if self.state.trees.contains_key(&win.workspace.to_string()) {
+            self.send(json!({"cmd": "layout", "op": "move", "id": id, "target": target, "side": side}));
+        }
+    }
+
     fn start_pane_on(&mut self, host: Option<String>) {
         self.overlay = Overlay::None;
         match host {
@@ -1303,6 +1338,12 @@ impl Tessella {
     /// the bridge refuses them: those are done here, as near as they can be.
     fn run_action(&mut self, action: String, cx: &mut Context<Self>) {
         self.status = None;
+        // A split of a pane on another machine opens on that machine too.
+        if let Some(side) = model::split_side(&action) {
+            if let Some(win) = self.focused_win().filter(|w| !w.host.is_empty()).cloned() {
+                return self.split_on_host(win, side);
+            }
+        }
         match action.as_str() {
             "new_window" | "prefix_new_window" | "window_prefix_new" => self.new_pane(),
             "tessella_themes" => self.open_themes(),

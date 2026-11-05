@@ -282,6 +282,15 @@ fn gap_between(panes: &[&Win]) -> Option<i32> {
     gaps.into_iter().min()
 }
 
+/// Where a split action puts its new pane: right of the focused one, or below it.
+pub fn split_side(action: &str) -> Option<&'static str> {
+    match action {
+        "split_vertical" | "prefix_split_vertical" => Some("right"),
+        "split_horizontal" | "prefix_split_horizontal" => Some("bottom"),
+        _ => None,
+    }
+}
+
 /// The cells a stage of this size holds. Panes are one gap apart, and the layout
 /// counts a gap after the last pane too, so that much comes off.
 pub fn stage_grid((w, h): (f32, f32), (cell_w, cell_h): (f32, f32), gap: i32) -> (u16, u16) {
@@ -349,6 +358,15 @@ mod tests {
         // One pane and no tree of its own, as on a new workspace or a scrolling one.
         state.workspace = 2;
         assert_eq!((state.layout_gap(), state.unused_chrome()), (None, None));
+    }
+
+    #[test]
+    fn a_split_goes_where_its_name_says() {
+        assert_eq!(split_side("prefix_split_vertical"), Some("right"));
+        assert_eq!(split_side("split_vertical"), Some("right"));
+        assert_eq!(split_side("prefix_split_horizontal"), Some("bottom"));
+        assert_eq!(split_side("split_horizontal"), Some("bottom"));
+        assert_eq!(split_side("rotate_split"), None);
     }
 
     #[test]

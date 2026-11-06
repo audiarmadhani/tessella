@@ -23,6 +23,7 @@ pub const TEMPLATE: &str = r#"# Tessella settings. Every line is optional: delet
 
 [panes]
 # confirm_close = true
+# predict_remote_typing = true
 
 [animation]
 # enabled = true
@@ -103,11 +104,13 @@ impl Default for ThemeSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct PaneSettings {
     pub confirm_close: bool,
+    /// Draw typed letters before a pane on another machine echoes them.
+    pub predict_remote_typing: bool,
 }
 
 impl Default for PaneSettings {
     fn default() -> Self {
-        Self { confirm_close: true }
+        Self { confirm_close: true, predict_remote_typing: true }
     }
 }
 

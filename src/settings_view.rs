@@ -220,6 +220,7 @@ impl Tessella {
         let t = &self.theme;
         let s = &self.settings;
         let confirm = s.panes.confirm_close;
+        let predict = s.panes.predict_remote_typing;
         let animated = s.animation.enabled;
         let current = s.animation.duration_ms;
         let segments: Vec<_> = SPEEDS
@@ -253,8 +254,8 @@ impl Tessella {
             .bg(rgb(theme::mix(t.palette.bg, t.text, 0.09)))
             .children(segments);
         vec![
-            self.card(vec![self
-                .row(
+            self.card(vec![
+                self.row(
                     "Confirm before closing a pane",
                     "Ask first when a key would close a pane and whatever runs in it.",
                     self.toggle(
@@ -265,7 +266,20 @@ impl Tessella {
                         cx,
                     ),
                 )
-                .into_any_element()])
+                .into_any_element(),
+                self.row(
+                    "Predict typing on other machines",
+                    "Show letters as you type, before the other machine echoes them. Passwords stay hidden.",
+                    self.toggle(
+                        predict,
+                        std::rc::Rc::new(move |this, cx| {
+                            this.change_setting(cx, |doc| doc["panes"]["predict_remote_typing"] = value(!predict));
+                        }),
+                        cx,
+                    ),
+                )
+                .into_any_element(),
+            ])
             .into_any_element(),
             self.card(vec![
                 self.row(

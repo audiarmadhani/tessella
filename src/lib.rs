@@ -11,6 +11,7 @@ pub mod model;
 pub mod native_input;
 pub mod notify;
 pub mod picker;
+pub mod predict;
 pub mod rail;
 pub mod settings;
 pub mod terminal;

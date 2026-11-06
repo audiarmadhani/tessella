@@ -147,6 +147,10 @@ impl Tessella {
                 if past == 0 {
                     if let Some(report) = self.panes.get(&win.pty).and_then(|p| p.mouse_report(0, true, col, row)) {
                         let _ = self.writer.input(&win.pty, &report);
+                        // A click can move where typing goes.
+                        if let Some(pane) = self.panes.get_mut(&win.pty) {
+                            pane.predict_reset();
+                        }
                         self.mouse_down = Some((win.pty.clone(), (col, row)));
                     }
                 }

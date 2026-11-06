@@ -1,15 +1,17 @@
 //! One pane's emulator, and the styled text a renderer draws from it.
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::search::{Match, RegexSearch};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use crate::predict::Predictor;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::selection::SelectionType;
@@ -83,6 +85,8 @@ pub struct Pane {
     anchor: Option<Point>,
     /// The search match on screen.
     found: Option<Match>,
+    /// Typed letters drawn ahead of their echo, on a pane on another machine.
+    predictor: Predictor,
 }
 
 fn mix(a: u32, b: u32, t: f32) -> u32 {
@@ -140,6 +144,14 @@ fn resolve(color: Color, palette: &Palette) -> Option<u32> {
     }
 }
 
+/// The character in a cell of the screen, with scrollback left out.
+fn cell_at(grid: &Grid<Cell>, lines: usize, col: usize, row: usize) -> char {
+    if row >= lines || col >= grid.columns() {
+        return ' ';
+    }
+    grid[Point::new(Line(row as i32), Column(col))].c
+}
+
 fn dim(c: u32) -> u32 {
     let f = |shift: u32| (((c >> shift) & 0xff) * 2 / 3) << shift;
     f(16) | f(8) | f(0)
@@ -150,7 +162,34 @@ impl Pane {
         let size = TermSize::new(cols.max(1) as usize, rows.max(1) as usize);
         let copies = Copies::default();
         let term = Term::new(Config { kitty_keyboard: true, ..Config::default() }, &size, copies.clone());
-        Self { term, copies, parser: Processor::new(), anchor: None, found: None }
+        Self { term, copies, parser: Processor::new(), anchor: None, found: None, predictor: Predictor::default() }
+    }
+
+    /// Where a typed letter would land, if the cursor is on show.
+    fn typing_cursor(&self) -> Option<(usize, usize)> {
+        let point = self.term.grid().cursor.point;
+        (self.term.mode().contains(TermMode::SHOW_CURSOR) && !self.term.mode().contains(TermMode::VI))
+            .then_some(())
+            .and_then(|()| usize::try_from(point.line.0).ok().map(|row| (point.column.0, row)))
+    }
+
+    /// Tells the predictor what was just sent to the program.
+    pub fn predict_typed(&mut self, bytes: &[u8]) {
+        match bytes {
+            [byte @ 0x20..=0x7e] => {
+                let (cursor, cols, now) = (self.typing_cursor(), self.term.columns(), Instant::now());
+                let grid = self.term.grid();
+                let lines = self.term.screen_lines();
+                self.predictor.typed(*byte as char, cursor, cols, |col, row| cell_at(grid, lines, col, row), now);
+            }
+            [0x7f] => self.predictor.erased(),
+            _ => self.predictor.reset(),
+        }
+    }
+
+    /// Forgets the guesses, as when input went to the program by another way.
+    pub fn predict_reset(&mut self) {
+        self.predictor.reset();
     }
 
     /// The text the program asked to put on the clipboard (OSC 52) since last asked.
@@ -159,10 +198,19 @@ impl Pane {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
+        let was_alt = self.alt_screen();
         self.parser.advance(&mut self.term, bytes);
+        if self.alt_screen() != was_alt {
+            return self.predictor.reset();
+        }
+        let cursor = self.typing_cursor();
+        let lines = self.term.screen_lines();
+        let grid = self.term.grid();
+        self.predictor.settle(cursor, |col, row| cell_at(grid, lines, col, row), Instant::now());
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.predictor.reset();
         if cols > 0 && rows > 0 {
             self.term.resize(TermSize::new(cols as usize, rows as usize));
         }
@@ -559,7 +607,105 @@ impl Pane {
                 row.push(Run { col, text: ch.to_string(), fg, bg, bold, italic, underline });
             }
         }
+        let mut cursor = cursor;
+        if cursor.is_some() && !block_cursor {
+            // Slightly faint until the program's own echo replaces it.
+            let fg = mix(palette.fg, palette.bg, 0.3);
+            for guess in self.predictor.shown(Instant::now()) {
+                if let Some(row) = rows.get_mut(guess.row) {
+                    row.push(Run { col: guess.col, text: guess.ch.to_string(), fg, bg: None, bold: false, italic: false, underline: false });
+                    cursor = Some((guess.col + 1, guess.row));
+                }
+            }
+        }
         Screen { rows, cursor, block_cursor }
+    }
+}
+
+#[cfg(test)]
+mod predict_tests {
+    use super::*;
+
+    fn palette() -> Palette {
+        Palette::default()
+    }
+
+    fn drawn(p: &Pane) -> String {
+        let screen = p.screen(&palette());
+        let mut cells = vec![' '; 40];
+        for run in &screen.rows[0] {
+            for (i, ch) in run.text.chars().enumerate() {
+                cells[run.col + i] = ch;
+            }
+        }
+        cells.iter().collect::<String>().trim_end().to_string()
+    }
+
+    #[test]
+    fn a_letter_shows_at_once_after_the_program_has_echoed_one() {
+        let mut p = Pane::new(40, 3);
+        p.feed(b"$ ");
+        p.predict_typed(b"l");
+        assert_eq!(drawn(&p), "$");
+        p.feed(b"l");
+        p.predict_typed(b"s");
+        assert_eq!(drawn(&p), "$ ls");
+        assert_eq!(p.screen(&palette()).cursor, Some((4, 0)));
+        p.feed(b"s");
+        assert_eq!(drawn(&p), "$ ls");
+        assert_eq!(p.screen(&palette()).cursor, Some((4, 0)));
+    }
+
+    #[test]
+    fn the_enter_key_makes_the_next_line_earn_trust_again() {
+        let mut p = Pane::new(40, 3);
+        p.feed(b"$ ");
+        p.predict_typed(b"l");
+        p.feed(b"l");
+        p.predict_typed(b"\r");
+        p.predict_typed(b"x");
+        assert_eq!(drawn(&p), "$ l");
+    }
+
+    #[test]
+    fn a_program_that_hides_the_cursor_gets_no_guesses() {
+        let mut p = Pane::new(40, 3);
+        p.feed(b"$ ");
+        p.predict_typed(b"l");
+        p.feed(b"l\x1b[?25l");
+        p.predict_typed(b"s");
+        assert_eq!(drawn(&p), "$ l");
+    }
+
+    #[test]
+    fn a_program_that_paints_the_echo_at_the_cursor_is_confirmed() {
+        // The bytes Claude Code sends for a key at its prompt.
+        let mut p = Pane::new(40, 12);
+        p.feed(b"\x1b[?1049h\x1b[10;3H");
+        p.predict_typed(b"q");
+        p.feed(b"\x1b[?25l\x1b[H\r\x1b[2C\x1b[9Bq\x1b[K\x1b[12;1H\x1b[10;4H\x1b[?25h");
+        p.predict_typed(b"z");
+        let screen = p.screen(&palette());
+        assert_eq!(screen.cursor, Some((4, 9)));
+        assert!(screen.rows[9].iter().any(|r| r.col == 3 && r.text == "z"));
+        p.feed(b"\x1b[?25l\x1b[H\r\x1b[3C\x1b[9Bz\x1b[12;1H\x1b[10;5H\x1b[?25h");
+        assert_eq!(p.screen(&palette()).cursor, Some((4, 9)));
+        // The echo kept the trust, so the next letter shows straight away.
+        p.predict_typed(b"x");
+        let screen = p.screen(&palette());
+        assert_eq!(screen.cursor, Some((5, 9)));
+        assert!(screen.rows[9].iter().any(|r| r.col == 4 && r.text == "x"));
+    }
+
+    #[test]
+    fn leaving_the_full_screen_ends_the_guessing() {
+        let mut p = Pane::new(40, 3);
+        p.feed(b"\x1b[?1049h");
+        p.predict_typed(b"l");
+        p.feed(b"l");
+        p.predict_typed(b"s");
+        p.feed(b"\x1b[?1049l");
+        assert_eq!(p.screen(&palette()).rows[0].iter().filter(|r| r.text == "s").count(), 0);
     }
 }
 

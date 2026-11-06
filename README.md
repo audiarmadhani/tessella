@@ -42,7 +42,7 @@ to set up. Tessella is an independent project, not part of tuios.
 | <img src="docs/assets/icon-files.png" width="32" alt=""> | **File manager** | Create, rename, copy, cut, paste, trash, search and send files from the sidebar, with a right-click menu, on this machine or another |
 | <img src="docs/assets/icon-markdown.png" width="32" alt=""> | **Markdown panes** | `.md` files open rendered in a tiled pane, from any machine, and reload when the file changes |
 | <img src="docs/assets/icon-keys.png" width="32" alt=""> | **Your keys** | Your tuios prefix and keybindings work as they are. Pause after the prefix and it shows what comes next |
-| <img src="docs/assets/icon-machines.png" width="32" alt=""> | **Other machines** | Open panes on any machine in your tuios `[hosts]`, and browse, open and move its files from the sidebar |
+| <img src="docs/assets/icon-machines.png" width="32" alt=""> | **Other machines** | Open panes on any machine in your tuios `[hosts]`, and browse, open and move its files from the sidebar. On a slow link, typed letters show before the machine echoes them |
 | <img src="docs/assets/icon-themes.png" width="32" alt=""> | **Themes** | Every tuios theme, with live preview and favourites, plus copy mode, a command palette and a settings window |
 
 ## Screenshots

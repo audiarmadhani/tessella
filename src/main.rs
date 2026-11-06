@@ -32,6 +32,7 @@ use tessella::keys::{self, Mods};
 use tessella::machines::{self, Machine, MachinePicker};
 use tessella::model::{self, Resolved, State, Win};
 use tessella::picker::{favourites_first, Item, Picker};
+use tessella::predict;
 use tessella::rail::{self, Entry, Fleet, Filter, Group, Row};
 use tessella::settings::{self, Settings};
 use tessella::terminal::{Pane, Screen, SelectionType, Side};
@@ -1694,6 +1695,9 @@ impl Tessella {
         // A pasted newline is a carriage return to a terminal program.
         let body = text.replace("\r\n", "\r").replace('\n', "\r");
         let bytes = if bracketed { format!("\x1b[200~{body}\x1b[201~") } else { body };
+        if let Some(pane) = self.panes.get_mut(pty) {
+            pane.predict_reset();
+        }
         if let Err(err) = self.writer.input(pty, bytes.as_bytes()) {
             self.status = Some(format!("Could not paste: {err}"));
         }
@@ -2112,8 +2116,24 @@ impl Tessella {
             if let Err(err) = self.writer.input(&pty, &bytes) {
                 self.status = Some(format!("Could not type: {err}"));
             }
+            if self.predicts_typing() {
+                if let Some(pane) = self.panes.get_mut(&pty) {
+                    if m.platform {
+                        pane.predict_reset();
+                    } else {
+                        pane.predict_typed(&bytes);
+                    }
+                }
+                // A guess with no echo has to leave the screen with no output to prompt it.
+                Self::wake_after(predict::PATIENCE + Duration::from_millis(20), cx);
+            }
             cx.notify();
         }
+    }
+
+    /// Whether the focused pane runs on another machine, where an echo takes a while.
+    fn predicts_typing(&self) -> bool {
+        self.settings.panes.predict_remote_typing && (self.target_host.is_some() || self.focused_win().is_some_and(|w| !w.host.is_empty()))
     }
 
     /// The scale a pane's text is drawn at. Tiled panes on a workspace share the

@@ -1,6 +1,6 @@
 //! One pane's emulator, and the styled text a renderer draws from it.
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
@@ -9,10 +9,18 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use std::sync::{Arc, Mutex};
 
 pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::selection::SelectionType;
 pub use alacritty_terminal::vi_mode::ViMotion;
+
+/// A link in a pane's text, and the cells it covers as row, first column and end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundLink {
+    pub link: crate::links::Link,
+    pub cells: Vec<(usize, usize, usize)>,
+}
 
 /// A pane's colours. A theme change repaints from this, with no reparse.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,8 +62,22 @@ pub struct Screen {
     pub block_cursor: bool,
 }
 
+/// What the emulator hands back: only the text programs put on the clipboard. Every
+/// other reply it would make goes unsent, because tuios answers the program itself.
+#[derive(Clone, Default)]
+struct Copies(Arc<Mutex<Vec<String>>>);
+
+impl EventListener for Copies {
+    fn send_event(&self, event: Event) {
+        if let (Event::ClipboardStore(_, text), Ok(mut copies)) = (event, self.0.lock()) {
+            copies.push(text);
+        }
+    }
+}
+
 pub struct Pane {
-    term: Term<VoidListener>,
+    term: Term<Copies>,
+    copies: Copies,
     parser: Processor,
     /// Where the current visual selection began, for swapping its ends.
     anchor: Option<Point>,
@@ -126,7 +148,14 @@ fn dim(c: u32) -> u32 {
 impl Pane {
     pub fn new(cols: u16, rows: u16) -> Self {
         let size = TermSize::new(cols.max(1) as usize, rows.max(1) as usize);
-        Self { term: Term::new(Config { kitty_keyboard: true, ..Config::default() }, &size, VoidListener), parser: Processor::new(), anchor: None, found: None }
+        let copies = Copies::default();
+        let term = Term::new(Config { kitty_keyboard: true, ..Config::default() }, &size, copies.clone());
+        Self { term, copies, parser: Processor::new(), anchor: None, found: None }
+    }
+
+    /// The text the program asked to put on the clipboard (OSC 52) since last asked.
+    pub fn take_copies(&mut self) -> Vec<String> {
+        self.copies.0.lock().map_or_else(|_| Vec::new(), |mut copies| std::mem::take(&mut copies))
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -216,6 +245,60 @@ impl Pane {
     }
 
     /// Whether the program asked for the mouse.
+    /// The link at a cell on screen. Its line is followed across soft wraps, so a long
+    /// address counts as one. A terminal hyperlink comes before anything in the text.
+    pub fn link_under(&self, col: usize, row: usize) -> Option<FoundLink> {
+        let grid = self.term.grid();
+        let offset = grid.display_offset() as i32;
+        let cols = grid.columns();
+        let clicked = Line(row as i32 - offset);
+        if clicked < grid.topmost_line() || clicked > grid.bottommost_line() || col >= cols {
+            return None;
+        }
+        let wraps = |line: Line| grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+        let mut first = clicked;
+        while first > grid.topmost_line() && wraps(first - 1) {
+            first = first - 1;
+        }
+        let mut last = clicked;
+        while last < grid.bottommost_line() && wraps(last) {
+            last = last + 1;
+        }
+        // Each character with its place, leaving out the blank half of a wide letter.
+        let mut chars: Vec<(char, Line, usize)> = Vec::new();
+        let mut line = first;
+        while line <= last {
+            for c in 0..cols {
+                let cell = &grid[line][Column(c)];
+                if !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                    chars.push((if cell.c == '\0' { ' ' } else { cell.c }, line, c));
+                }
+            }
+            line = line + 1;
+        }
+        let at = chars.iter().position(|(_, l, c)| *l == clicked && *c == col)?;
+        let cells_of = |range: std::ops::Range<usize>| {
+            let mut cells: Vec<(usize, usize, usize)> = Vec::new();
+            for (_, line, c) in &chars[range] {
+                let Ok(row) = usize::try_from(line.0 + offset) else { continue };
+                match cells.last_mut() {
+                    Some(last) if last.0 == row => last.2 = c + 1,
+                    _ => cells.push((row, *c, c + 1)),
+                }
+            }
+            cells
+        };
+        if let Some(hyperlink) = grid[clicked][Column(col)].hyperlink() {
+            let same = |i: &usize| grid[chars[*i].1][Column(chars[*i].2)].hyperlink().is_some_and(|h| h == hyperlink);
+            let start = (0..at).rev().find(|i| !same(i)).map_or(0, |i| i + 1);
+            let end = (at..chars.len()).find(|i| !same(i)).unwrap_or(chars.len());
+            return crate::links::from_uri(hyperlink.uri()).map(|link| FoundLink { link, cells: cells_of(start..end) });
+        }
+        let text: String = chars.iter().map(|(c, ..)| *c).collect();
+        let (range, link) = crate::links::find(&text, at)?;
+        Some(FoundLink { link, cells: cells_of(range) })
+    }
+
     pub fn wants_mouse(&self) -> bool {
         self.term.mode().intersects(TermMode::MOUSE_MODE)
     }
@@ -481,6 +564,34 @@ impl Pane {
 }
 
 #[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::links::Link;
+
+    #[test]
+    fn a_long_address_is_one_link_across_a_wrap() {
+        let mut pane = Pane::new(20, 4);
+        pane.feed(b"go https://example.dev/a/long/path now");
+        let found = pane.link_under(5, 0).unwrap();
+        assert_eq!(found.link, Link::Url("https://example.dev/a/long/path".into()));
+        assert_eq!(found.cells, vec![(0, 3, 20), (1, 0, 14)]);
+        // The second row finds the same one.
+        assert_eq!(pane.link_under(2, 1).unwrap().link, found.link);
+        assert_eq!(pane.link_under(0, 0), None);
+    }
+
+    #[test]
+    fn a_terminal_hyperlink_is_what_its_program_named() {
+        let mut pane = Pane::new(40, 4);
+        pane.feed(b"\x1b]8;;https://a.dev/x\x1b\\docs\x1b]8;;\x1b\\ plain");
+        let found = pane.link_under(1, 0).unwrap();
+        assert_eq!(found.link, Link::Url("https://a.dev/x".into()));
+        assert_eq!(found.cells, vec![(0, 0, 4)]);
+        assert_eq!(pane.link_under(6, 0), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -551,6 +662,16 @@ mod tests {
         assert_eq!(p.size(), (40, 10));
         p.resize(0, 0);
         assert_eq!(p.size(), (40, 10));
+    }
+
+    #[test]
+    fn a_program_can_set_the_clipboard_but_not_read_it() {
+        let mut pane = Pane::new(20, 4);
+        pane.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        pane.feed(b"\x1b]52;c;?\x07");
+        pane.feed(b"plain text");
+        assert_eq!(pane.take_copies(), vec!["hello".to_string()]);
+        assert!(pane.take_copies().is_empty());
     }
 
     #[test]

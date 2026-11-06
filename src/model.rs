@@ -18,6 +18,24 @@ pub struct State {
     pub client_size: Size,
     /// Each workspace's split tree, by workspace number, while the layout is one.
     pub trees: std::collections::HashMap<String, Tree>,
+    /// Where the scrolling layout is settling, while that is the layout on screen.
+    pub strip: Option<Strip>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct Strip {
+    /// The strip cell at the left edge of the screen.
+    pub viewport: i32,
+    pub panes: Vec<StripPane>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct StripPane {
+    pub id: String,
+    pub x: i32,
+    pub w: i32,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -173,6 +191,32 @@ impl State {
             .or_else(|| self.trees.values().next().map(|t| t.bounds))
             .filter(|b| b.w > 0 && b.h > 0)
             .unwrap_or(Rect { x: 0, y: 0, w: self.session_size.cols as i32, h: self.session_size.rows as i32 })
+    }
+
+    /// Whether the focus moved to a pane that was not here before. tuios moves the strip
+    /// for a new pane only when none of the pane shows.
+    pub fn focus_moved_to_new_pane(&self, before: &State) -> bool {
+        self.session == before.session && !before.windows.iter().any(|w| w.id == self.focused)
+    }
+
+    /// Whether the scrolling layout leaves part of a pane outside the cells on show,
+    /// which start at `from` and run for `cols`.
+    pub fn is_cut_off(&self, id: &str, from: i32, cols: i32) -> bool {
+        let Some(strip) = &self.strip else { return false };
+        let Some(pane) = strip.panes.iter().find(|p| p.id == id) else { return false };
+        let left = pane.x - strip.viewport - from;
+        left < 0 || left + pane.w > cols
+    }
+
+    /// Another pane on the strip to step through on the way to `id`: the one the focus
+    /// came from if it is on the strip, or else the nearest.
+    pub fn reveal_step(&self, id: &str, previous: &str) -> Option<String> {
+        let panes = &self.strip.as_ref()?.panes;
+        let at = panes.iter().find(|p| p.id == id)?.x;
+        if previous != id && panes.iter().any(|p| p.id == previous) {
+            return Some(previous.to_string());
+        }
+        panes.iter().filter(|p| p.id != id).min_by_key(|p| (p.x - at).abs()).map(|p| p.id.clone())
     }
 
     /// The cells between neighbouring panes on this workspace, if anything on it says.
@@ -358,6 +402,44 @@ mod tests {
         // One pane and no tree of its own, as on a new workspace or a scrolling one.
         state.workspace = 2;
         assert_eq!((state.layout_gap(), state.unused_chrome()), (None, None));
+    }
+
+    #[test]
+    fn a_pane_is_cut_off_by_what_is_on_show() {
+        let pane = |id: &str, x| StripPane { id: id.into(), x, w: 85 };
+        let state = |viewport| State { strip: Some(Strip { viewport, panes: vec![pane("a", 0), pane("b", 86)] }), ..Default::default() };
+        assert!(state(0).is_cut_off("b", 0, 114));
+        assert!(!state(57).is_cut_off("b", 0, 114));
+        assert!(state(40).is_cut_off("a", 0, 114));
+        // It would fit in the whole session, but tuios keeps part of that for chrome.
+        assert!(state(0).is_cut_off("a", 0, 80));
+        // A pane the strip does not hold, such as a floating one, and any other layout.
+        assert!(!state(40).is_cut_off("floating", 0, 114));
+        assert!(!State::default().is_cut_off("a", 0, 114));
+    }
+
+    #[test]
+    fn a_new_pane_is_one_that_was_not_here_in_this_session() {
+        let win = |id: &str| Win { id: id.into(), ..Default::default() };
+        let before = State { session: "s".into(), focused: "a".into(), windows: vec![win("a")], ..Default::default() };
+        let after = |focused: &str| State { session: "s".into(), focused: focused.into(), windows: vec![win("a"), win("b")], ..Default::default() };
+        assert!(after("b").focus_moved_to_new_pane(&before));
+        assert!(!after("a").focus_moved_to_new_pane(&before));
+        // Another session's panes are all new.
+        assert!(!after("b").focus_moved_to_new_pane(&State { session: "t".into(), ..before.clone() }));
+    }
+
+    #[test]
+    fn the_step_to_a_pane_stays_on_its_strip() {
+        let pane = |id: &str, x| StripPane { id: id.into(), x, w: 85 };
+        let panes = vec![pane("a", 0), pane("b", 86), pane("c", 172)];
+        let state = State { strip: Some(Strip { viewport: 0, panes }), ..Default::default() };
+        assert_eq!(state.reveal_step("a", "c").as_deref(), Some("c"));
+        // A previous pane that is the same one, closed, or on another workspace.
+        assert_eq!(state.reveal_step("a", "a").as_deref(), Some("b"));
+        assert_eq!(state.reveal_step("c", "gone").as_deref(), Some("b"));
+        let alone = State { strip: Some(Strip { viewport: 0, panes: vec![pane("a", 0)] }), ..Default::default() };
+        assert_eq!(alone.reveal_step("a", "gone"), None);
     }
 
     #[test]

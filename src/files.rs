@@ -49,6 +49,32 @@ pub fn stat_stamp(answer: &serde_json::Value) -> Option<i64> {
     answer["info"]["mtime"].as_i64().filter(|_| answer["exists"] == true)
 }
 
+/// Keeps a pasted image for a program to read, in a folder only this user can open.
+/// Images older than a day go, since nothing else ever removes them.
+pub fn save_pasted_image(bytes: &[u8], extension: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join("tessella-images");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(&dir)?;
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let old = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() > 86_400);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let path = dir.join(format!("paste-{stamp}.{extension}"));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// A path as typed at a shell, quoted only if it needs it.
+pub fn shell_quote(path: &str) -> String {
+    let plain = !path.is_empty() && path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+=:@,".contains(&b));
+    if plain { path.to_string() } else { format!("'{}'", path.replace('\'', "'\\''")) }
+}
+
 /// A file error from tuios, as one line for the status bar. A copy prints several
 /// lines, and a refused write spends most of its words on the name of each machine.
 pub fn plain_error(raw: &str) -> String {
@@ -255,6 +281,13 @@ mod tests {
         let there = serde_json::json!({"exists": true, "info": {"mtime": 1793882987284_i64}, "size": 28});
         assert_eq!(stat_stamp(&there), Some(1793882987284));
         assert_eq!(stat_stamp(&serde_json::json!({"exists": false, "size": 0})), None);
+    }
+
+    #[test]
+    fn a_path_is_quoted_only_when_a_shell_would_split_it() {
+        assert_eq!(shell_quote("/a/b-c_d.png"), "/a/b-c_d.png");
+        assert_eq!(shell_quote("/a b/c.png"), "'/a b/c.png'");
+        assert_eq!(shell_quote("/it's $x"), "'/it'\\''s $x'");
     }
 
     #[test]

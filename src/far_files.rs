@@ -21,6 +21,10 @@ pub(super) enum FileReply {
     /// When a Markdown file last changed, for a pane.
     DocStamp { window: String, place: Place },
     DocText { window: String, stamp: i64 },
+    /// Whether a link in a far pane names something, and what.
+    LinkStat { place: Place, line: Option<u32> },
+    /// tuios is copying files to a pane's machine, and these paths go to the pane.
+    TypePaths { pty: String },
 }
 
 /// A failed search in words that mean something to the person using it.
@@ -97,6 +101,20 @@ impl Tessella {
             FileReply::Search { folder } => self.show_far_search(folder, result),
             FileReply::DocStamp { window, place } => self.doc_stamp_answered(window, place, result),
             FileReply::DocText { window, stamp } => self.doc_text_answered(&window, stamp, result),
+            FileReply::LinkStat { place, line } => {
+                if files::stat_stamp(result).is_none() {
+                    self.status = Some(format!("No file at {} on {}.", place.path.display(), place.host));
+                    return;
+                }
+                let dir = result["info"]["kind"] == "dir" || result["info"]["link_kind"] == "dir";
+                self.open_link_place(place, dir, line);
+            }
+            FileReply::TypePaths { pty } => {
+                let paths = result["paths"].as_array().into_iter().flatten().filter_map(Value::as_str);
+                let paths: Vec<String> = paths.map(files::shell_quote).collect();
+                self.status = None;
+                self.paste_text(&pty, &paths.join(" "));
+            }
         }
     }
 
@@ -130,6 +148,7 @@ impl Tessella {
             FileReply::Changed { .. } => self.files_changed(Err(std::io::Error::other(error.to_string()))),
             FileReply::Search { .. } => self.status = Some(plain_search_error(error)),
             FileReply::DocStamp { window, .. } | FileReply::DocText { window, .. } => self.doc_failed(&window, error),
+            FileReply::LinkStat { .. } | FileReply::TypePaths { .. } => self.status = Some(files::plain_error(error)),
         }
     }
 
@@ -262,6 +281,46 @@ impl Tessella {
         });
         self.search_host = folder.host.clone();
         self.overlay = Overlay::Chooser(ChooserKind::FileSearch, Picker::new(items.collect(), String::new()));
+    }
+
+    /// Files dropped on a pane: their paths, typed as a terminal does.
+    pub(super) fn drop_paths(&mut self, paths: Vec<PathBuf>, window: &Window) {
+        let under = self.window_under(window.mouse_position(), window).cloned();
+        let Some(win) = under.or_else(|| self.focused_win().cloned()) else { return };
+        self.send(json!({"cmd": "focus", "window": win.id}));
+        self.give_paths(&win, paths);
+    }
+
+    /// Types paths into a pane. A pane on another machine cannot read this one, so
+    /// tuios copies them there first, and the pane gets the paths they land at.
+    fn give_paths(&mut self, win: &Win, paths: Vec<PathBuf>) {
+        if win.markdown_place().is_some() || paths.is_empty() {
+            return;
+        }
+        let host = self.files_host_of(win);
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        if host.is_empty() {
+            let quoted: Vec<String> = paths.iter().map(|p| files::shell_quote(p)).collect();
+            return self.paste_text(&win.pty, &quoted.join(" "));
+        }
+        self.status = Some(format!("Copying {} to {host}…", if paths.len() == 1 { "1 file".to_string() } else { format!("{} files", paths.len()) }));
+        self.ask("drop-files", json!({"host": host, "paths": paths}), Reply::Files(FileReply::TypePaths { pty: win.pty.clone() }));
+    }
+
+    /// An image from the clipboard goes to a file, and the pane gets its path, which is
+    /// how a terminal program takes a picture.
+    pub(super) fn paste_image(&mut self, bytes: &[u8], extension: &str) {
+        let Some(win) = self.focused_win().cloned() else { return };
+        match files::save_pasted_image(bytes, extension) {
+            Ok(path) => self.give_paths(&win, vec![path]),
+            Err(err) => self.status = Some(format!("Could not paste the image: {err}")),
+        }
+    }
+
+    pub(super) fn ask_link_stat(&mut self, place: Place, line: Option<u32>) {
+        let host = place.host.clone();
+        let path = place.path.to_string_lossy().into_owned();
+        self.ask_far(&host, "file-stat", json!({"path": path}), FileReply::LinkStat { place, line });
     }
 
     /// Asks when a far Markdown file last changed.

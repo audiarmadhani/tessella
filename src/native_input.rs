@@ -11,7 +11,9 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 const LEFT_MOUSE_DOWN: usize = 1;
 const LEFT_MOUSE_UP: usize = 2;
 const LEFT_MOUSE_DRAGGED: usize = 6;
+const MOUSE_MOVED: usize = 5;
 const CONTROL: usize = 1 << 18;
+const COMMAND: usize = 1 << 20;
 const KEY_DOWN: usize = 10;
 const KEY_UP: usize = 11;
 
@@ -116,6 +118,23 @@ unsafe fn mouse_with(view: usize, kind: usize, x: f64, y: f64, clicks: isize, fl
 pub unsafe fn click(view: usize, x: f64, y: f64, clicks: isize) {
     mouse(view, LEFT_MOUSE_DOWN, x, y, clicks);
     mouse(view, LEFT_MOUSE_UP, x, y, clicks);
+}
+
+/// Clicks with Cmd held.
+///
+/// # Safety
+/// As for `ns_window`.
+pub unsafe fn cmd_click(view: usize, x: f64, y: f64) {
+    mouse_with(view, LEFT_MOUSE_DOWN, x, y, 1, COMMAND);
+    mouse_with(view, LEFT_MOUSE_UP, x, y, 1, COMMAND);
+}
+
+/// Moves the pointer with Cmd held.
+///
+/// # Safety
+/// As for `ns_window`.
+pub unsafe fn cmd_move(view: usize, x: f64, y: f64) {
+    mouse_with(view, MOUSE_MOVED, x, y, 0, COMMAND);
 }
 
 /// Clicks with control held, which is a right click on a Mac.

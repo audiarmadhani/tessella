@@ -82,6 +82,9 @@ impl Tessella {
             Some((mode.label(), t.accent_text, None))
         } else if self.keymap.in_prefix() {
             Some((format!("{} …", self.keymap.leader()), t.accent_text, None))
+        } else if let Some(hover) = &self.link_hover {
+            // What a click opens, since a program can name any address behind any text.
+            Some((hover.target.clone(), t.muted, None))
         } else if let Some(s) = &self.status {
             Some((s.clone(), t.text, None))
         } else {
@@ -183,6 +186,28 @@ impl Tessella {
                         cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.open_agents(super::agents_view::AgentsTab::Inbox);
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(8.0))
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .text_size(px(12.0))
+                    .text_color(rgb(t.text))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child("Changes")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_changes();
                             cx.notify();
                         }),
                     ),
@@ -1034,6 +1059,8 @@ impl Tessella {
         // What the button does, and whether a program stops because of it.
         let (go, stops_programs) = match &p.kind {
             PromptKind::Confirm(Confirm::Trash(_)) => ("Move  ⏎", false),
+            PromptKind::Confirm(Confirm::RestoreCheckpoint { .. }) => ("Go back  ⏎", false),
+            PromptKind::Confirm(Confirm::RemoveWorktree { .. }) => ("Remove  ⏎", true),
             PromptKind::Confirm(Confirm::DeleteForever(_) | Confirm::DeleteLayout(_)) => ("Delete  ⏎", false),
             _ => ("Close  ⏎", true),
         };

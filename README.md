@@ -37,7 +37,8 @@ to set up. Tessella is an independent project, not part of tuios.
 | <img src="docs/assets/icon-mouse.png" width="32" alt=""> | **A real mouse** | Drag split lines to resize and headers to move panes, use the scrollbar, and select text. Programs that ask for the mouse get clicks and the wheel |
 | <img src="docs/assets/icon-agents.png" width="32" alt=""> | **Agents at a glance** | See every agent's state in the sidebar and the Agents tab, message them, and answer `tuios ask-human` questions with a click |
 | <img src="docs/assets/icon-inbox.png" width="32" alt=""> | **Inbox and mail** | Approvals, questions, errors and mail in one list, with mail to agents on your other machines |
-| <img src="docs/assets/icon-review.png" width="32" alt=""> | **Review** | Read what an agent changed, leave notes on lines, and send them back to it |
+| <img src="docs/assets/icon-review.png" width="32" alt=""> | **Review** | See what an agent changed, unified or side by side, in all or turn by turn, and go back to a turn. Leave notes on lines and send them back to it |
+| <img src="docs/assets/icon-panes.png" width="32" alt=""> | **Worktrees and fan-out** | Give a task its own worktree, or send one prompt to several agents, each in its own |
 | <img src="docs/assets/icon-files.png" width="32" alt=""> | **File manager** | Create, rename, copy, cut, paste, trash, search and send files from the sidebar, with a right-click menu, on this machine or another |
 | <img src="docs/assets/icon-markdown.png" width="32" alt=""> | **Markdown panes** | `.md` files open rendered in a tiled pane, from any machine, and reload when the file changes |
 | <img src="docs/assets/icon-keys.png" width="32" alt=""> | **Your keys** | Your tuios prefix and keybindings work as they are. Pause after the prefix and it shows what comes next |
@@ -74,7 +75,8 @@ brew install audiarmadhani/tap/tessella
 ```
 
 This builds Tessella from source and installs tuios if you do not have it. The first build takes a
-few minutes.
+few minutes. If your tuios is out of date, Homebrew upgrades it too, and a running daemon needs
+`tuios restart-server` to follow, which stops the programs in your panes.
 
 Or build it yourself, with [Rust](https://rustup.rs) and tuios installed:
 
@@ -86,6 +88,14 @@ cargo build --release
 ```
 
 Tessella is tested with tuios 0.11.1 and 0.12.1.
+
+To open it from the Dock or Spotlight and get Mac notifications, make an app from a clone:
+
+```sh
+scripts/make-app.sh --install    # puts Tessella.app in /Applications
+```
+
+It is signed for your Mac only, so it needs no Apple account.
 
 From a clone, `scripts/try.sh` tries it without touching your live sessions. It uses a private tuios
 daemon with a copy of your tuios keys.
@@ -113,14 +123,19 @@ These are Tessella's own, on top of tuios's:
 | `cmd+n` | New pane, asking which machine if you have hosts |
 | `cmd+1` to `cmd+9` | Go to a workspace |
 | `cmd+shift+t` | Theme picker |
+| `cmd+shift+d` | What the focused pane's agent changed |
 | `cmd+,` | Open settings |
 | `cmd+=`, `cmd+-`, `cmd+0` | Zoom the text and interface in, out, and back |
 | `cmd+left`, `cmd+right`, `cmd+backspace` | Start of the line, end of the line, delete to its start |
+| `cmd+click` | Open the address or file path under the pointer, at its line in editors that take `+N` |
 
 `ctrl+shift` chords from tuios's GUI table are read as `cmd`.
 
 macOS keeps `ctrl+left` and `ctrl+right` for switching Spaces by default. Turn that off in System
 Settings under Keyboard Shortcuts, Mission Control, and they move by word.
+
+Drag files onto a pane to type their paths. `cmd+v` with an image on the clipboard does the same
+with the image. For a pane on another machine, tuios copies them there first.
 
 In a pane, a program that asks for the mouse gets it. Hold `shift` to select its text instead.
 Double-click a pane's header to rename it.
@@ -143,6 +158,10 @@ agents_height = 190
 
 [panes]
 confirm_close = true
+
+[notifications]
+enabled = true          # Tell me when an agent needs me and I am looking elsewhere
+done = true             # And when one finishes
 
 [animation]
 enabled = true
@@ -175,7 +194,10 @@ is set to reduce motion.
 - Deleting a file on another machine is for good, since its Trash cannot be reached from here.
 - A new file on another machine needs its folder to exist already.
 - For an agent on another machine you can send mail. Its approvals and other actions are answered there.
+- For a pane on another machine, Changes shows uncommitted changes, read with `git` over ssh. It has no
+  turns or notes, as tuios keeps those panes out of its review. A worktree session on that machine has them.
 - Text input methods for languages such as Japanese are not supported yet.
+- Started from a terminal, as Homebrew installs it, a click on a notification cannot return to its pane. The app can.
 
 ## License
 

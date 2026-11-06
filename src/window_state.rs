@@ -23,6 +23,8 @@ pub struct WindowState {
     pub gap: i32,
     pub chrome: (u16, u16),
     pub border: (i32, i32),
+    /// Diffs in two columns rather than one.
+    pub diff_side_by_side: bool,
 }
 
 fn path() -> Option<PathBuf> {

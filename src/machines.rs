@@ -11,6 +11,8 @@ pub struct Machine {
     /// good, slow, stalled, reconnecting, signin or down. Empty for this machine.
     pub health: String,
     pub ready: bool,
+    /// How ssh reaches it. Empty for this machine.
+    pub addr: String,
 }
 
 /// This machine first, then each host from a bridge "hosts" event's `hosts`.
@@ -21,6 +23,7 @@ pub fn from_event(hosts: &Value) -> Vec<Machine> {
         detail: "Runs here".to_string(),
         health: String::new(),
         ready: true,
+        addr: String::new(),
     }];
     for h in hosts["hosts"].as_array().into_iter().flatten() {
         let Some(name) = h["name"].as_str() else { continue };
@@ -44,6 +47,7 @@ pub fn from_event(hosts: &Value) -> Vec<Machine> {
             detail,
             health: h["health"].as_str().unwrap_or_default().to_string(),
             ready,
+            addr: h["addr"].as_str().unwrap_or(name).to_string(),
         });
     }
     list

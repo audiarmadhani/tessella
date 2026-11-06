@@ -2,7 +2,7 @@
 //! Keys come from the person's tuios config, and every action is also a button.
 
 use super::*;
-use tessella::agents::{self, Answer, DiffFile, DiffOp, InboxItem, Mail, Note};
+use tessella::agents::{self, Answer, DiffFile, DiffLine, DiffOp, InboxItem, Mail, Note, SideRow, Turn, Worktree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(super) enum AgentsTab {
@@ -11,6 +11,7 @@ pub(super) enum AgentsTab {
     Agents,
     Mail,
     Review,
+    Work,
 }
 
 /// What the page is typing, and where it goes.
@@ -27,6 +28,12 @@ pub(super) enum Write {
     /// A new message to an agent, on any machine.
     MailBody { agent: rail::Agent },
     Note { path: String, line: i64, side: &'static str, hunk: String },
+    /// A branch for a new worktree of a repository, on a machine.
+    NewWorktree { host: String, repo: String },
+    /// The prompt to fan out.
+    FanPrompt { host: String, repo: String },
+    /// How many agents take that prompt, and which.
+    FanHow { host: String, repo: String, prompt: String },
 }
 
 /// The prompt or approval the Inbox cursor is on, read whole.
@@ -42,6 +49,8 @@ pub(super) struct Detail {
 /// The review on show.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Review {
+    /// The machine it is on, empty for this one.
+    pub host: String,
     pub session: String,
     pub window: String,
     pub name: String,
@@ -49,6 +58,15 @@ pub(super) struct Review {
     pub notes: Vec<Note>,
     pub file: usize,
     pub line: usize,
+    /// The agent's turns, newest first, and the one on show. None is everything.
+    pub turns: Vec<Turn>,
+    pub turn: Option<i64>,
+    pub loaded: Option<Instant>,
+    /// Why there is nothing to show.
+    pub problem: Option<String>,
+    /// A pane tuios runs on another machine, as ssh reaches it and its folder. Its
+    /// review is plain git over ssh, with no turns and no notes.
+    pub over_ssh: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,8 +86,11 @@ pub(super) struct AgentsPage {
     pub scroll: usize,
     /// Choosing who a new message goes to, from these agents.
     pub compose: Option<(Picker, Vec<rail::Agent>)>,
+    pub worktrees: Vec<Worktree>,
 }
 
+/// How many of an agent's turns get a chip. Older ones are a key press away.
+const TURN_CHIPS: usize = 8;
 /// The diff rows drawn at once.
 const DIFF_ROWS: usize = 40;
 /// How often other machines are asked for their agents while they are on show.
@@ -81,7 +102,12 @@ pub(super) enum AgentsReply {
     Approval(String),
     Peek(String),
     Mail,
-    Diff,
+    /// The changes on show, for this turn or all of them.
+    Diff { turn: Option<i64> },
+    Turns,
+    Worktrees(String),
+    WorktreeMade(String),
+    Fanned(i64),
     Notes,
     Done(String),
     HostAgents,
@@ -102,6 +128,7 @@ impl Tessella {
         match tab {
             AgentsTab::Inbox => self.load_detail(),
             AgentsTab::Mail => self.load_mail(),
+            AgentsTab::Work => self.load_worktrees(),
             AgentsTab::Agents | AgentsTab::Review => {}
         }
         // Ask again at once, rather than show what a while ago looked like.
@@ -200,22 +227,24 @@ impl Tessella {
                     page.mail = mail;
                 }
             }
-            AgentsReply::Diff => {
+            AgentsReply::Turns => self.turns_answered(result),
+            AgentsReply::Worktrees(host) => self.worktrees_answered(&host, result),
+            reply @ (AgentsReply::WorktreeMade(_) | AgentsReply::Fanned(_)) => self.work_answered(reply, result),
+            AgentsReply::Diff { turn } => {
                 let (files, notes) = (agents::parse_diff(result), agents::parse_notes(result));
-                if let Some(review) = self.page().and_then(|p| p.review.as_mut()) {
+                if let Some(review) = self.page().and_then(|p| p.review.as_mut()).filter(|r| r.turn == turn) {
+                    review.problem = None;
                     review.files = files;
-                    review.notes = notes;
+                    // A turn's answer has no notes, and the notes stay those of the whole.
+                    if turn.is_none() {
+                        review.notes = notes;
+                    }
                     review.file = review.file.min(review.files.len().saturating_sub(1));
+                    let lines = review.files.get(review.file).map_or(0, |f| f.lines.len());
+                    review.line = review.line.min(lines.saturating_sub(1));
                 }
             }
-            AgentsReply::Notes => {
-                let (session, window) = self
-                    .page()
-                    .and_then(|p| p.review.as_ref())
-                    .map(|r| (r.session.clone(), r.window.clone()))
-                    .unwrap_or_default();
-                self.load_diff(session, window);
-            }
+            AgentsReply::Notes => self.load_review(),
         }
     }
 
@@ -420,10 +449,10 @@ impl Tessella {
     }
 
     fn step_tab(&mut self, next: bool) {
-        const ORDER: [AgentsTab; 4] = [AgentsTab::Inbox, AgentsTab::Agents, AgentsTab::Mail, AgentsTab::Review];
+        const ORDER: [AgentsTab; 5] = [AgentsTab::Inbox, AgentsTab::Agents, AgentsTab::Mail, AgentsTab::Review, AgentsTab::Work];
         let Some(page) = self.page() else { return };
         let at = ORDER.iter().position(|t| *t == page.tab).unwrap_or(0);
-        let to = (at + if next { 1 } else { 3 }) % 4;
+        let to = (at + if next { 1 } else { ORDER.len() - 1 }) % ORDER.len();
         self.set_tab(ORDER[to]);
     }
 
@@ -576,16 +605,7 @@ impl Tessella {
     // ----- review -----
 
     pub(super) fn open_review(&mut self, session: String, window: String, name: String) {
-        if let Some(page) = self.page() {
-            page.tab = AgentsTab::Review;
-            page.scroll = 0;
-            page.review = Some(Review { session: session.clone(), window: window.clone(), name, ..Default::default() });
-        }
-        self.load_diff(session, window);
-    }
-
-    fn load_diff(&mut self, session: String, window: String) {
-        self.ask_agents("review-diff", json!({"session": session, "window": window}), AgentsReply::Diff);
+        self.open_review_on(String::new(), session, window, name);
     }
 
     fn review_key(&mut self, name: &str) {
@@ -612,6 +632,9 @@ impl Tessella {
                 review.file = review.file.saturating_sub(1);
                 review.line = 0;
             }
+            "n" | "S" | "R" if review.over_ssh.is_some() => {
+                self.status = Some("Notes and going back work for panes on this machine, or from a worktree.".into());
+            }
             "n" => {
                 let file = review.files.get(review.file);
                 let line = file.and_then(|f| f.lines.get(review.line));
@@ -625,6 +648,11 @@ impl Tessella {
                     page.write = Some((write, String::new()));
                 }
             }
+            "s" => self.diff_side_by_side = !self.diff_side_by_side,
+            "t" => self.step_turn(true),
+            "T" => self.step_turn(false),
+            "a" => self.show_turn(None),
+            "R" => self.ask_restore(),
             "S" => {
                 let (session, window) = (review.session.clone(), review.window.clone());
                 self.ask_agents("send-review", json!({"session": session, "window": window}), AgentsReply::Notes);
@@ -649,6 +677,7 @@ impl Tessella {
         }
         match tab {
             AgentsTab::Review => self.review_key(name),
+            AgentsTab::Work => self.work_key(name),
             AgentsTab::Mail => {
                 if let Some(action) = self.keymap.scope_action("mail", name).map(str::to_string) {
                     self.mail_action(&action);
@@ -742,6 +771,9 @@ impl Tessella {
             Write::MailBody { agent } => {
                 self.ask_agents("send-agent-message", agents::mail_params(&agent, &text), AgentsReply::MailSent(agent));
             }
+            Write::NewWorktree { host, repo } => self.make_worktree(&host, &repo, &text),
+            Write::FanPrompt { host, repo } => return self.ask_fan_how(host, repo, text),
+            Write::FanHow { host, repo, prompt } => self.start_fan(&host, &repo, &prompt, &text),
             Write::Note { path, line, side, hunk } => {
                 let review = self.page().and_then(|p| p.review.as_ref().map(|r| (r.session.clone(), r.window.clone())));
                 let Some((session, window)) = review else { return };
@@ -786,7 +818,8 @@ impl Tessella {
             AgentsTab::Inbox => self.inbox_view(page, cx).into_any_element(),
             AgentsTab::Agents => self.agents_list_view(page, cx).into_any_element(),
             AgentsTab::Mail => self.mail_view(page, cx).into_any_element(),
-            AgentsTab::Review => self.review_view(page).into_any_element(),
+            AgentsTab::Review => self.review_view(page, cx).into_any_element(),
+            AgentsTab::Work => self.work_view(page, cx),
         };
         let hint = match page.tab {
             AgentsTab::Inbox => "a allow  ·  A always  ·  R refuse  ·  r reply  ·  d dismiss  ·  z snooze  ·  u undo  ·  v review  ·  ⏎ go  ·  [ ] tabs  ·  esc",
@@ -794,7 +827,9 @@ impl Tessella {
             AgentsTab::Agents => "m mail  ·  r reply  ·  v review  ·  z snooze  ·  u unread  ·  x drop queued  ·  y resume  ·  ⏎ go  ·  [ ] tabs  ·  esc",
             AgentsTab::Mail if page.compose.is_some() => "type to filter  ·  ↑↓ choose  ·  ⏎ write  ·  esc cancel",
             AgentsTab::Mail => "⏎ open  ·  r reply  ·  n new message  ·  esc back  ·  [ ] tabs",
-            AgentsTab::Review => "j k line  ·  h l file  ·  n note  ·  S send notes  ·  [ ] tabs  ·  esc",
+            AgentsTab::Review if page.review.as_ref().is_some_and(|r| r.over_ssh.is_some()) => "j k line  ·  h l file  ·  s side by side  ·  [ ] tabs  ·  esc",
+            AgentsTab::Review => "j k line  ·  h l file  ·  s side by side  ·  t T turn  ·  a all  ·  R go back to turn  ·  n note  ·  S send notes  ·  [ ] tabs  ·  esc",
+            AgentsTab::Work => "j k choose  ·  n new  ·  f fan out  ·  v changes  ·  ⏎ go  ·  D remove  ·  [ ] tabs  ·  esc",
         };
         div()
             .flex()
@@ -813,7 +848,8 @@ impl Tessella {
                     .child(tab(if waiting > 0 { format!("Inbox  {waiting}") } else { "Inbox".into() }, AgentsTab::Inbox, cx))
                     .child(tab("Agents".into(), AgentsTab::Agents, cx))
                     .child(tab("Mail".into(), AgentsTab::Mail, cx))
-                    .child(tab("Review".into(), AgentsTab::Review, cx)),
+                    .child(tab("Review".into(), AgentsTab::Review, cx))
+                    .child(tab("Work".into(), AgentsTab::Work, cx)),
             )
             .child(div().flex_1().min_h_0().child(body))
             .when_some(page.write.as_ref(), |d, (write, text)| {
@@ -825,6 +861,10 @@ impl Tessella {
                     Write::MailBody { agent } if agent.host.is_empty() => format!("Mail for {}", agent.name),
                     Write::MailBody { agent } => format!("Mail for {} on {}", agent.name, agent.host),
                     Write::Note { path, line, .. } => format!("Note on {path}:{line}"),
+                    Write::NewWorktree { host, .. } if host.is_empty() => "Branch for the new worktree".to_string(),
+                    Write::NewWorktree { host, .. } => format!("Branch for the new worktree on {host}"),
+                    Write::FanPrompt { .. } => "The prompt every agent gets".to_string(),
+                    Write::FanHow { .. } => "How many, and which agents? Like: 3 claude,codex".to_string(),
                 };
                 d.child(
                     div()
@@ -1246,7 +1286,7 @@ impl Tessella {
             )
     }
 
-    fn review_view(&self, page: &AgentsPage) -> impl IntoElement {
+    fn review_view(&self, page: &AgentsPage, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
         let line_color = theme::mix(t.palette.bg, t.text, 0.14);
         let Some(review) = &page.review else {
@@ -1268,8 +1308,11 @@ impl Tessella {
         });
         let file = review.files.get(review.file);
         let first = review.line.saturating_sub(DIFF_ROWS / 2);
-        let rows: Vec<_> = file
-            .map(|f| {
+        let side_by_side = self.diff_side_by_side;
+        let rows: Vec<gpui::AnyElement> = file
+            .filter(|_| side_by_side)
+            .map(|f| self.side_diff_rows(review, f))
+            .or_else(|| file.map(|f| {
                 let path = f.path.clone();
                 f.lines
                     .iter()
@@ -1296,34 +1339,20 @@ impl Tessella {
                             .child(div().w(px(38.0)).flex_none().text_color(rgb(t.faint)).child(number))
                             .child(div().text_color(rgb(color)).whitespace_nowrap().child(SharedString::from(format!("{mark}{}", l.text))))
                             .into_any_element();
-                        let notes = review
-                            .notes
-                            .iter()
-                            .filter(|n| n.path == path && n.line > 0 && n.line == if l.op == DiffOp::Delete { l.old } else { l.new })
-                            .map(|n| {
-                                let state = if n.sent() { "sent" } else { "not sent" };
-                                div()
-                                    .ml(px(38.0))
-                                    .px(px(8.0))
-                                    .py(px(2.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(theme::mix(t.palette.bg, t.accent, 0.2)))
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(t.text))
-                                    .child(SharedString::from(format!("{} ({state})", n.text)))
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>();
+                        let notes = self.note_rows(review, &path, l);
                         std::iter::once(row).chain(notes)
                     })
                     .collect()
-            })
+            }))
             .unwrap_or_default();
         div()
             .flex()
             .flex_col()
             .size_full()
-            .child(div().flex_none().px(px(14.0)).py(px(6.0)).text_size(px(11.5)).text_color(rgb(t.muted)).border_b_1().border_color(rgb(line_color)).child(SharedString::from(format!("Changes by {}", review.name))))
+            .child(self.turn_bar(review, line_color, cx))
+            .when_some(review.problem.clone().or_else(|| review.files.is_empty().then(|| "No changes to show.".to_string())), |d, text| {
+                d.child(div().flex_none().px(px(14.0)).py(px(10.0)).text_size(px(12.5)).text_color(rgb(t.muted)).child(SharedString::from(text)))
+            })
             .child(
                 div()
                     .flex()
@@ -1333,6 +1362,178 @@ impl Tessella {
                     .child(div().flex_1().min_w_0().p(px(8.0)).overflow_hidden().children(rows)),
             )
             .into_any_element()
+    }
+
+    /// The notes on a line, to draw under it.
+    fn note_rows(&self, review: &Review, path: &str, l: &DiffLine) -> Vec<gpui::AnyElement> {
+        let t = &self.theme;
+        let at = if l.op == DiffOp::Delete { l.old } else { l.new };
+        review
+            .notes
+            .iter()
+            .filter(|n| n.path == path && n.line > 0 && n.line == at)
+            .map(|n| {
+                let state = if n.sent() { "sent" } else { "not sent" };
+                div()
+                    .ml(px(38.0))
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(theme::mix(t.palette.bg, t.accent, 0.2)))
+                    .text_size(px(11.0))
+                    .text_color(rgb(t.text))
+                    .child(SharedString::from(format!("{} ({state})", n.text)))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// One side of a side-by-side row. Long lines wrap, since half the width clips a lot.
+    fn side_cell(&self, review: &Review, file: &DiffFile, at: Option<usize>, old_side: bool) -> gpui::AnyElement {
+        let t = &self.theme;
+        let Some(l) = at.and_then(|at| file.lines.get(at)) else {
+            // Nothing on this side. A shade says so, rather than a blank line of code.
+            return div().flex_1().min_w_0().bg(rgb(theme::mix(t.palette.bg, t.text, 0.04))).into_any_element();
+        };
+        let accent = match l.op {
+            DiffOp::Add => t.agent("done").unwrap_or(t.accent),
+            DiffOp::Delete => t.agent("errored").unwrap_or(t.accent),
+            _ => t.text,
+        };
+        let number = if old_side { l.old } else { l.new };
+        let notes = self.note_rows(review, &file.path, l);
+        let notes = if l.op == DiffOp::Context && old_side { Vec::new() } else { notes };
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .when(l.op != DiffOp::Context, |d| d.bg(rgb(theme::mix(t.palette.bg, accent, 0.14))))
+            .child(
+                div()
+                    .flex()
+                    .text_size(px(11.5))
+                    .child(div().w(px(38.0)).flex_none().pl(px(4.0)).text_color(rgb(t.faint)).child(number.to_string()))
+                    .child(div().flex_1().min_w_0().text_color(rgb(accent)).child(SharedString::from(l.text.clone()))),
+            )
+            .children(notes)
+            .into_any_element()
+    }
+
+    /// A file's rows in two columns, around the line the cursor is on.
+    fn side_diff_rows(&self, review: &Review, file: &DiffFile) -> Vec<gpui::AnyElement> {
+        let t = &self.theme;
+        let line_color = theme::mix(t.palette.bg, t.text, 0.14);
+        let rows = agents::side_rows(&file.lines);
+        let cursor = rows.iter().position(|r| r.holds(review.line)).unwrap_or(0);
+        rows.iter()
+            .enumerate()
+            // Rows can wrap to several lines, so fewer go above the cursor than in one column.
+            .skip(cursor.saturating_sub(DIFF_ROWS / 4))
+            .take(DIFF_ROWS)
+            .map(|(i, row)| {
+                let on = i == cursor;
+                match *row {
+                    SideRow::Hunk(at) => div()
+                        .min_h(px(16.0))
+                        .my(px(2.0))
+                        .text_size(px(11.5))
+                        .text_color(rgb(t.muted))
+                        .when(on, |d| d.bg(rgb(t.selected)))
+                        .child(SharedString::from(file.lines[at].text.clone()))
+                        .into_any_element(),
+                    SideRow::Pair { old, new } => div()
+                        .flex()
+                        .min_h(px(16.0))
+                        // Always a border, so that the cursor arriving moves nothing.
+                        .border_1()
+                        .border_color(if on { rgb(t.accent).into() } else { gpui::transparent_black() })
+                        .child(self.side_cell(review, file, old, true))
+                        .child(div().w(px(1.0)).flex_none().bg(rgb(line_color)))
+                        .child(self.side_cell(review, file, new, false))
+                        .into_any_element(),
+                }
+            })
+            .collect()
+    }
+
+    /// Who changed this, and a chip for all of it and for each recent turn.
+    fn turn_bar(&self, review: &Review, line: u32, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = &self.theme;
+        let chip = |label: String, on: bool, turn: Option<i64>, cx: &mut Context<Self>| {
+            div()
+                .flex_none()
+                .px(px(8.0))
+                .py(px(2.0))
+                .rounded(px(5.0))
+                .text_size(px(11.5))
+                .cursor_pointer()
+                .when(on, |d| d.bg(rgb(t.accent)).text_color(rgb(t.on_accent)))
+                .when(!on, |d| d.text_color(rgb(t.muted)))
+                .child(SharedString::from(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.show_turn(turn);
+                        cx.notify();
+                    }),
+                )
+        };
+        let chips: Vec<_> = review
+            .turns
+            .iter()
+            .take(TURN_CHIPS)
+            .map(|turn| {
+                let label = if turn.label.is_empty() { format!("Turn {}", turn.n) } else { format!("{} {}", turn.n, turn.label) };
+                chip(label, review.turn == Some(turn.n), Some(turn.n), cx).into_any_element()
+            })
+            .collect();
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(14.0))
+            .py(px(5.0))
+            .overflow_hidden()
+            .border_b_1()
+            .border_color(rgb(line))
+            .child(div().flex_none().pr(px(8.0)).text_size(px(11.5)).text_color(rgb(t.muted)).child(SharedString::from(match &review.over_ssh {
+                Some(_) => format!("Uncommitted changes by {}", review.name),
+                None => format!("Changes by {}", review.name),
+            })))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(4.0))
+                    .overflow_hidden()
+                    .when(review.over_ssh.is_none(), |d| d.child(chip("All".to_string(), review.turn.is_none(), None, cx)))
+                    .children(chips),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .ml(px(8.0))
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgb(line))
+                    .text_size(px(11.5))
+                    .text_color(rgb(t.text))
+                    .cursor_pointer()
+                    .child(if self.diff_side_by_side { "Unified" } else { "Side by side" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.diff_side_by_side = !this.diff_side_by_side;
+                            cx.notify();
+                        }),
+                    ),
+            )
     }
 
     /// The questions from ask-human, over the panes. They answer by click only, so

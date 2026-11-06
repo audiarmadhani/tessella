@@ -81,6 +81,85 @@ pub fn parse_items(attention: &Value) -> Vec<InboxItem> {
     attention["items"].as_array().into_iter().flatten().filter_map(|i| serde_json::from_value(i.clone()).ok()).collect()
 }
 
+/// One agent turn that changed files, which tuios saved as a checkpoint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn {
+    pub n: i64,
+    pub label: String,
+    /// Unix nanoseconds.
+    pub at: i64,
+}
+
+/// The checkpoints of a pane, newest first. A safety one, which a restore makes, is a
+/// place to go back to as well.
+pub fn parse_turns(answer: &Value) -> Vec<Turn> {
+    let mut turns: Vec<Turn> = answer["checkpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let n = c["n"].as_i64()?;
+            let label = c["label"].as_str().filter(|l| !l.is_empty()).or(c["kind"].as_str().filter(|k| *k == "safety")).unwrap_or_default();
+            Some(Turn { n, label: label.to_string(), at: c["at"].as_i64().unwrap_or(0) })
+        })
+        .collect();
+    turns.sort_by_key(|t| std::cmp::Reverse(t.n));
+    turns
+}
+
+/// The turn next to the one on show. None is everything, which comes before the newest.
+pub fn next_turn(turns: &[Turn], on_show: Option<i64>, older: bool) -> Option<i64> {
+    let at = on_show.and_then(|n| turns.iter().position(|t| t.n == n));
+    match (at, older) {
+        (None, true) => turns.first().map(|t| t.n),
+        (None, false) => None,
+        (Some(0), false) => None,
+        (Some(i), false) => Some(turns[i - 1].n),
+        (Some(i), true) => Some(turns.get(i + 1).map_or(turns[i].n, |t| t.n)),
+    }
+}
+
+/// A git worktree with its own session, on a machine.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Worktree {
+    pub host: String,
+    pub session: String,
+    pub repo: String,
+    pub branch: String,
+    pub group: String,
+    pub state: String,
+    pub uncommitted: Option<i64>,
+    pub ahead: Option<i64>,
+    pub merged: bool,
+}
+
+pub fn parse_worktrees(host: &str, answer: &Value) -> Vec<Worktree> {
+    let text = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let rows = answer["worktrees"].as_array().into_iter().flatten();
+    // A main checkout is listed too, but no worktree action applies to it.
+    rows.filter(|w| w["gone"] != true && w["main"] != true)
+        .map(|w| Worktree {
+            host: host.to_string(),
+            session: text(w, "session"),
+            repo: text(w, "repo"),
+            branch: text(w, "branch"),
+            group: text(w, "group"),
+            state: text(w, "state"),
+            uncommitted: w["changes"].as_i64(),
+            ahead: w["ahead"].as_i64(),
+            merged: w["merged"] == true,
+        })
+        .collect()
+}
+
+/// `3 claude,codex` as how many agents, and which, cycled across them.
+pub fn parse_fan(text: &str) -> Option<(i64, Vec<String>)> {
+    let (count, names) = text.trim().split_once(char::is_whitespace)?;
+    let count: i64 = count.parse().ok().filter(|n| (1..=16).contains(n))?;
+    let names: Vec<String> = names.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect();
+    (!names.is_empty()).then_some((count, names))
+}
+
 /// `seconds` as a short age: 5s, 12m, 3h, 2d.
 pub fn age(seconds: i64) -> String {
     match seconds.max(0) {
@@ -262,6 +341,115 @@ pub fn parse_diff(result: &Value) -> Vec<DiffFile> {
         .collect()
 }
 
+/// One row of a side-by-side diff. Each number is a place in the file's lines.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SideRow {
+    Hunk(usize),
+    Pair { old: Option<usize>, new: Option<usize> },
+}
+
+impl SideRow {
+    pub fn holds(self, line: usize) -> bool {
+        match self {
+            Self::Hunk(at) => at == line,
+            Self::Pair { old, new } => old == Some(line) || new == Some(line),
+        }
+    }
+}
+
+/// Lines as rows for two columns. Removed lines sit beside the lines that replaced them,
+/// in order, and any left over face a gap.
+pub fn side_rows(lines: &[DiffLine]) -> Vec<SideRow> {
+    let mut rows = Vec::new();
+    let mut at = 0;
+    while at < lines.len() {
+        match lines[at].op {
+            DiffOp::Hunk => {
+                rows.push(SideRow::Hunk(at));
+                at += 1;
+            }
+            DiffOp::Context => {
+                rows.push(SideRow::Pair { old: Some(at), new: Some(at) });
+                at += 1;
+            }
+            DiffOp::Delete | DiffOp::Add => {
+                let run = |from: usize, op: DiffOp| from + lines[from..].iter().take_while(|l| l.op == op).count();
+                let adds = run(at, DiffOp::Delete);
+                let end = run(adds, DiffOp::Add);
+                let (removed, added) = (adds - at, end - adds);
+                for i in 0..removed.max(added) {
+                    rows.push(SideRow::Pair { old: (i < removed).then_some(at + i), new: (i < added).then_some(adds + i) });
+                }
+                at = end;
+            }
+        }
+    }
+    rows
+}
+
+/// Marks where the list of new files starts, after the diff, in what a far read prints.
+pub const UNTRACKED_MARK: &str = "@@tessella-untracked@@";
+
+/// The numbers in `@@ -1,2 +3,4 @@`.
+fn hunk_start(header: &str) -> Option<(i64, i64)> {
+    let mut parts = header.split_whitespace().skip(1);
+    let number = |part: &str| part[1..].split(',').next()?.parse().ok();
+    Some((number(parts.next()?)?, number(parts.next()?)?))
+}
+
+/// Plain `git diff` output as files, with new files named after a mark. A pane on
+/// another machine has no tuios review, so its changes come back as this.
+pub fn parse_unified(text: &str) -> Vec<DiffFile> {
+    let (diff, untracked) = text.split_once(UNTRACKED_MARK).unwrap_or((text, ""));
+    // The line break the mark is printed after is not part of the diff.
+    let diff = diff.strip_suffix('\n').unwrap_or(diff);
+    let mut files: Vec<DiffFile> = Vec::new();
+    let (mut hunk, mut old, mut new) = (String::new(), 0, 0);
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // `a/x b/x`, whose two halves match, which tells them apart with spaces in it.
+            let half = (rest.len().saturating_sub(1)) / 2;
+            let path = rest.get(half + 1..).unwrap_or(rest);
+            files.push(DiffFile { path: path.strip_prefix("b/").unwrap_or(path).to_string(), status: "modified".to_string(), ..Default::default() });
+            hunk.clear();
+            continue;
+        }
+        let Some(file) = files.last_mut() else { continue };
+        if line.starts_with("@@") {
+            hunk = line.to_string();
+            (old, new) = hunk_start(line).unwrap_or((0, 0));
+            file.lines.push(DiffLine { op: DiffOp::Hunk, old: 0, new: 0, text: line.to_string(), hunk: hunk.clone() });
+        } else if hunk.is_empty() {
+            if line.starts_with("Binary files") {
+                file.binary = true;
+            } else if line.starts_with("new file") {
+                file.status = "added".to_string();
+            } else if line.starts_with("deleted file") {
+                file.status = "deleted".to_string();
+            }
+        } else if let Some(text) = line.strip_prefix('+') {
+            file.added += 1;
+            file.lines.push(DiffLine { op: DiffOp::Add, old: 0, new, text: text.to_string(), hunk: hunk.clone() });
+            new += 1;
+        } else if let Some(text) = line.strip_prefix('-') {
+            file.removed += 1;
+            file.lines.push(DiffLine { op: DiffOp::Delete, old, new: 0, text: text.to_string(), hunk: hunk.clone() });
+            old += 1;
+        } else if !line.starts_with('\\') {
+            file.lines.push(DiffLine { op: DiffOp::Context, old, new, text: line.strip_prefix(' ').unwrap_or(line).to_string(), hunk: hunk.clone() });
+            old += 1;
+            new += 1;
+        }
+    }
+    files.extend(untracked.lines().filter(|l| !l.is_empty()).map(|path| DiffFile {
+        path: path.to_string(),
+        status: "added".to_string(),
+        lines: vec![DiffLine { op: DiffOp::Hunk, old: 0, new: 0, text: "A new file, not added to git yet".to_string(), hunk: String::new() }],
+        ..Default::default()
+    }));
+    files
+}
+
 /// A review note, as review-diff lists them.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
@@ -286,6 +474,99 @@ impl Note {
 
 pub fn parse_notes(result: &Value) -> Vec<Note> {
     result["notes"].as_array().into_iter().flatten().filter_map(|n| serde_json::from_value(n.clone()).ok()).collect()
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn turns() -> Vec<Turn> {
+        parse_turns(&json!({"checkpoints": [
+            {"n": 1, "kind": "turn", "label": "first", "at": 5},
+            {"n": 2, "kind": "safety", "at": 6},
+            {"n": 3, "kind": "turn", "at": 7},
+        ]}))
+    }
+
+    #[test]
+    fn side_by_side_puts_a_change_beside_what_it_replaced() {
+        let line = |op| DiffLine { op, old: 0, new: 0, text: String::new(), hunk: String::new() };
+        let lines: Vec<DiffLine> = [DiffOp::Hunk, DiffOp::Context, DiffOp::Delete, DiffOp::Delete, DiffOp::Add, DiffOp::Context, DiffOp::Add, DiffOp::Delete].map(line).into();
+        let pair = |old, new| SideRow::Pair { old, new };
+        let rows = side_rows(&lines);
+        assert_eq!(
+            rows,
+            [
+                SideRow::Hunk(0),
+                pair(Some(1), Some(1)),
+                pair(Some(2), Some(4)),
+                pair(Some(3), None),
+                pair(Some(5), Some(5)),
+                pair(None, Some(6)),
+                pair(Some(7), None),
+            ]
+        );
+        // Every line has one row to be found in, so the cursor never gets lost.
+        for at in 0..lines.len() {
+            assert!(rows.iter().any(|r| r.holds(at)), "line {at}");
+        }
+        assert!(side_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn plain_git_diff_reads_as_files() {
+        let text = "diff --git a/my file.txt b/my file.txt\nindex 1..2 100644\n--- a/my file.txt\n+++ b/my file.txt\n@@ -2,2 +2,3 @@ fn x\n one\n-two\n+TWO\n+three\ndiff --git a/g.png b/g.png\nBinary files a/g.png and b/g.png differ\n\n@@tessella-untracked@@\nnew.txt\n";
+        let files = parse_unified(text);
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["my file.txt", "g.png", "new.txt"]);
+        let f = &files[0];
+        assert_eq!((f.added, f.removed, f.lines.len()), (2, 1, 5));
+        assert_eq!((f.lines[1].old, f.lines[1].new), (2, 2));
+        assert_eq!((f.lines[2].op, f.lines[2].old), (DiffOp::Delete, 3));
+        assert_eq!((f.lines[3].op, f.lines[3].new), (DiffOp::Add, 3));
+        assert!(files[1].binary);
+        assert_eq!(files[2].status, "added");
+        assert!(parse_unified("").is_empty());
+    }
+
+    #[test]
+    fn the_newest_turn_comes_first() {
+        let t = turns();
+        assert_eq!(t.iter().map(|t| t.n).collect::<Vec<_>>(), [3, 2, 1]);
+        assert_eq!((t[1].label.as_str(), t[2].label.as_str()), ("safety", "first"));
+    }
+
+    #[test]
+    fn stepping_goes_from_everything_through_each_turn_and_back() {
+        let t = turns();
+        assert_eq!(next_turn(&t, None, true), Some(3));
+        assert_eq!(next_turn(&t, Some(3), true), Some(2));
+        assert_eq!(next_turn(&t, Some(1), true), Some(1));
+        assert_eq!(next_turn(&t, Some(2), false), Some(3));
+        assert_eq!(next_turn(&t, Some(3), false), None);
+        assert_eq!(next_turn(&[], None, true), None);
+    }
+
+    #[test]
+    fn a_fan_is_a_count_and_its_agents() {
+        assert_eq!(parse_fan("3 claude"), Some((3, vec!["claude".to_string()])));
+        assert_eq!(parse_fan(" 2 claude, codex --model o5 "), Some((2, vec!["claude".to_string(), "codex --model o5".to_string()])));
+        assert_eq!(parse_fan("claude"), None);
+        assert_eq!(parse_fan("99 claude"), None);
+        assert_eq!(parse_fan("3 "), None);
+    }
+
+    #[test]
+    fn a_removed_worktree_is_left_out() {
+        let answer = json!({"worktrees": [
+            {"session": "a", "repo": "r", "branch": "b", "changes": 2, "ahead": 1, "merged": false},
+            {"session": "gone", "gone": true},
+            {"session": "checkout", "main": true},
+        ]});
+        let rows = parse_worktrees("build", &answer);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].host.as_str(), rows[0].uncommitted, rows[0].ahead), ("build", Some(2), Some(1)));
+    }
 }
 
 #[cfg(test)]

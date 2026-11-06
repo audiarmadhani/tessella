@@ -6,9 +6,12 @@ mod agents_view;
 mod far_files;
 mod file_actions;
 mod md_view;
+mod notices;
+mod pane_links;
 mod settings_view;
 mod stage_mouse;
 mod views;
+mod work_view;
 
 use gpui::{
     ContentMask, Subscription, canvas, div, fill, font, point, prelude::*, px, quad, rgb, size, App, Application, BorderStyle, Bounds,
@@ -18,7 +21,7 @@ use gpui::{
 };
 use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -57,6 +60,8 @@ const FONT_MIN: f32 = 9.0;
 const FONT_MAX: f32 = 22.0;
 /// The scope of tuios's keys for a file row.
 const FILE_SCOPE: &str = "sidebar.files";
+/// Runs the person's editor on `$0`, at line `$1` if there is one and it can.
+const EDIT_SCRIPT: &str = r#"e=${EDITOR:-vi}; p=${e%% *}; case "${p##*/}" in vi|vim|nvim|nano|emacs|hx|kak|micro) [ -n "$1" ] && exec $e "+$1" "$0";; esac; exec $e "$0""#;
 /// Marks a palette row that tuios runs by name.
 const PALETTE_ROW: &str = "palette:";
 /// How long to wait for tuios to answer a change of size.
@@ -167,6 +172,8 @@ enum Confirm {
     DeleteLayout(String),
     Trash(PathBuf),
     DeleteForever(tessella::files::Place),
+    RestoreCheckpoint { host: String, session: String, window: String, n: i64 },
+    RemoveWorktree { host: String, session: String },
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +256,8 @@ struct PaneDraw {
     badge: Option<usize>,
     /// The scale its text is drawn at, so that it fits its card.
     fit: f32,
+    /// The cells of the link under the pointer, to underline.
+    link: Vec<(usize, usize, usize)>,
 }
 
 /// A workspace change on its way across the stage.
@@ -337,6 +346,14 @@ struct Tessella {
     menu_entry: Option<Entry>,
     stage_drag: Option<stage_mouse::StageDrag>,
     stage_cursor: gpui::CursorStyle,
+    link_hover: Option<pane_links::LinkHover>,
+    notices: notices::Notices,
+    review_wake: Option<Instant>,
+    diff_side_by_side: bool,
+    /// A far pane's changes, once read beside the window.
+    far_diff: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    far_diff_running: bool,
+    pointer: Option<Point<Pixels>>,
     /// The cell a program following the mouse was last told about.
     mouse_seen: Option<(usize, usize)>,
     /// When the open prefix was pressed, for the which-key popup.
@@ -348,6 +365,10 @@ struct Tessella {
     pane_preview: Option<(String, Vec<String>)>,
     /// Panes on their way to new places.
     layout_move: Option<LayoutMove>,
+    /// A press on a pane until the button comes up: the pane, where, and the focus before.
+    click_reveal: Option<(String, Point<Pixels>, String)>,
+    /// tuios's appearance.selection.osc52_write.
+    osc52_write: String,
     /// The pane a mouse press went to, and the cell it was last told about.
     mouse_down: Option<(String, (usize, usize))>,
     device_scale: f32,
@@ -421,6 +442,9 @@ impl Tessella {
             Ok(b) => b,
             Err(err) => {
                 eprintln!("tessella: {err}");
+                if tessella::notify::is_bundled() {
+                    tessella::notify::alert(&err.to_string());
+                }
                 std::process::exit(1);
             }
         };
@@ -488,12 +512,21 @@ impl Tessella {
             menu_entry: None,
             stage_drag: None,
             stage_cursor: gpui::CursorStyle::Arrow,
+            link_hover: None,
+            notices: notices::Notices::default(),
+            review_wake: None,
+            diff_side_by_side: saved.as_ref().is_some_and(|s| s.diff_side_by_side),
+            far_diff: Default::default(),
+            far_diff_running: false,
+            pointer: None,
             mouse_seen: None,
             prefix_at: None,
             replies: HashMap::new(),
             next_req: 100,
             pane_preview: None,
             layout_move: None,
+            click_reveal: None,
+            osc52_write: "focused".to_string(),
             mouse_down: None,
             device_scale: 1.0,
             size_sent: None,
@@ -590,6 +623,24 @@ impl Tessella {
                     // SAFETY: the main thread, outside any update, and this task
                     // ends with the window.
                     unsafe { tessella::native_input::raise(view) };
+                } else if let Some(at) = word.strip_prefix("cmdclick:") {
+                    let n: Vec<f64> = at.split(',').filter_map(|v| v.parse().ok()).collect();
+                    if let [x, y] = n[..] {
+                        // SAFETY: as above.
+                        unsafe { tessella::native_input::cmd_click(view, x, y) };
+                    }
+                } else if let Some(at) = word.strip_prefix("cmdhover:") {
+                    let n: Vec<f64> = at.split(',').filter_map(|v| v.parse().ok()).collect();
+                    if let [x, y] = n[..] {
+                        // SAFETY: as above.
+                        unsafe { tessella::native_input::cmd_move(view, x, y) };
+                    }
+                } else if let Some(path) = word.strip_prefix("drop:") {
+                    let paths = vec![PathBuf::from(path)];
+                    let _ = this.update_in(cx, |app, window, cx| {
+                        app.drop_paths(paths, window);
+                        cx.notify();
+                    });
                 } else if let Some(at) = word.strip_prefix("click:") {
                     let n: Vec<f64> = at.split(',').filter_map(|v| v.parse().ok()).collect();
                     if let [x, y, rest @ ..] = n.as_slice() {
@@ -678,7 +729,7 @@ impl Tessella {
                 }
                 let alive = this.update(cx, |app, cx| {
                     for frame in batch {
-                        app.apply(frame);
+                        app.apply(frame, cx);
                     }
                     cx.notify();
                 });
@@ -694,11 +745,15 @@ impl Tessella {
         .detach();
     }
 
-    fn apply(&mut self, frame: Frame) {
+    fn apply(&mut self, frame: Frame, cx: &mut Context<Self>) {
         match frame {
             Frame::Event(event) => self.apply_event(event),
             Frame::Output { pty, bytes } => {
-                self.panes.entry(pty).or_insert_with(|| Pane::new(80, 24)).feed(&bytes);
+                let pane = self.panes.entry(pty.clone()).or_insert_with(|| Pane::new(80, 24));
+                pane.feed(&bytes);
+                for text in pane.take_copies() {
+                    self.pane_copied(&pty, text, cx);
+                }
             }
             // A snapshot rebuilds a reset emulator. When the daemon has no state
             // for the pane, it sends 0x0 with no bytes: nothing to rebuild from.
@@ -706,6 +761,8 @@ impl Tessella {
             Frame::Snapshot { pty, cols, rows, bytes } => {
                 let mut pane = Pane::new(cols, rows);
                 pane.feed(&bytes);
+                // A copy in here is one from before, not one being made now.
+                pane.take_copies();
                 self.panes.insert(pty, pane);
             }
             Frame::Resize { pty, cols, rows } => {
@@ -733,8 +790,17 @@ impl Tessella {
                     } else {
                         self.layout_move = None;
                     }
+                    if self.state.session.is_empty() {
+                        self.send(json!({"cmd": "options"}));
+                    }
+                    let new_pane = state.focus_moved_to_new_pane(&self.state);
+                    let previous = std::mem::take(&mut self.state.focused);
                     self.state = state;
                     self.place_host_split();
+                    if new_pane {
+                        let focused = self.state.focused.clone();
+                        self.reveal_if_cut_off(&focused, &previous);
+                    }
                     self.sync_session_size();
                     let live: Vec<&str> = self.state.windows.iter().map(|w| w.pty.as_str()).collect();
                     self.panes.retain(|pty, _| live.contains(&pty.as_str()));
@@ -749,6 +815,12 @@ impl Tessella {
                     } else {
                         self.asked_for_pane = false;
                     }
+                }
+            }
+            Some("options") => {
+                let rows = event["options"]["options"].as_array().into_iter().flatten();
+                if let Some(mode) = rows.filter(|o| o["path"] == "appearance.selection.osc52_write").find_map(|o| o["value"].as_str()) {
+                    self.osc52_write = mode.to_string();
                 }
             }
             Some("theme") => {
@@ -814,6 +886,9 @@ impl Tessella {
                     let error = result["error"].as_str().unwrap_or("That did not work.");
                     match reply {
                         Some(Reply::Files(reply)) => self.file_failed(reply, error, result["code"].as_str().unwrap_or_default()),
+                        Some(Reply::Agents(agents_view::AgentsReply::Diff { .. })) => self.review_failed(error),
+                        // A pane outside a git repository has no turns, and Review says why.
+                        Some(Reply::Agents(agents_view::AgentsReply::Turns | agents_view::AgentsReply::Worktrees(_))) => {}
                         _ => self.status = Some(error.to_string()),
                     }
                 } else if let Some(reply) = reply {
@@ -997,7 +1072,14 @@ impl Tessella {
     }
 
     fn open_palette(&mut self) {
-        let mut items = vec![Item::new("Change theme", "⇧⌘T", "tessella_themes"), Item::new("Open settings", "⌘,", "tessella_settings")];
+        let mut items = vec![
+            Item::new("Changes in this pane", "⇧⌘D", "tessella_review"),
+            Item::new("Worktrees", "", "tessella_worktrees"),
+            Item::new("New worktree", "", "tessella_new_worktree"),
+            Item::new("Fan out a prompt", "", "tessella_fan"),
+            Item::new("Change theme", "⇧⌘T", "tessella_themes"),
+            Item::new("Open settings", "⌘,", "tessella_settings"),
+        ];
         items.extend(self.palette_rows.iter().cloned());
         self.overlay = Overlay::Chooser(ChooserKind::Palette, Picker::new(items, String::new()));
     }
@@ -1143,7 +1225,9 @@ impl Tessella {
     /// Focuses a pane, going to its session first when it is in another one.
     fn focus_anywhere(&mut self, session: &str, window: &str) {
         if session == self.state.session {
+            let previous = self.state.focused.clone();
             self.send(json!({"cmd": "focus", "window": window}));
+            self.reveal_if_cut_off(window, &previous);
         } else {
             self.verb("focus-window", json!({"session": session, "window": window}));
             self.switch_session(session);
@@ -1253,6 +1337,8 @@ impl Tessella {
                 };
                 self.files_changed(result);
             }
+            Confirm::RestoreCheckpoint { host, session, window, n } => self.restore_turn(&host, &session, &window, n),
+            Confirm::RemoveWorktree { host, session } => self.remove_worktree(&host, &session),
             Confirm::DeleteForever(what) if !what.is_here() => self.far_delete(&what),
             Confirm::DeleteForever(what) => {
                 let name = what.name();
@@ -1317,6 +1403,22 @@ impl Tessella {
         self.ask("new-window", params, Reply::HostSplit { target: win.id, side });
     }
 
+    /// Brings a pane just focused all the way on screen, if the scrolling layout has part
+    /// of it off. Asking for a pane is asking to see it. The bridge has no command that
+    /// only does this, but tuios does it after a focus key, and going to the last pane
+    /// is such a key. A step to another pane on the strip makes this one the last pane,
+    /// whatever tuios remembered: that pane may have closed, or be on another workspace.
+    fn reveal_if_cut_off(&mut self, id: &str, previous: &str) {
+        let b = self.state.layout_box();
+        if !self.state.is_cut_off(id, b.x, self.layout_cells().0) {
+            return;
+        }
+        if let Some(step) = self.state.reveal_step(id, previous) {
+            self.send(json!({"cmd": "focus", "window": step}));
+            self.send(json!({"cmd": "action", "name": "last_pane"}));
+        }
+    }
+
     /// Moves a split's new pane beside its old one, once the layout holds it.
     fn place_host_split(&mut self) {
         let Some((id, target, side)) = self.host_split.clone() else { return };
@@ -1372,6 +1474,10 @@ impl Tessella {
         match action.as_str() {
             "new_window" | "prefix_new_window" | "window_prefix_new" => self.new_pane(),
             "tessella_themes" => self.open_themes(),
+            "tessella_review" => self.open_changes(),
+            "tessella_worktrees" => self.open_agents(agents_view::AgentsTab::Work),
+            "tessella_new_worktree" => self.start_work(false),
+            "tessella_fan" => self.start_work(true),
             "tessella_new_pane" => self.new_pane(),
             "tessella_new_workspace" | "new_workspace" => self.new_workspace(),
             "tessella_settings" | "prefix_settings" => self.overlay = Overlay::Settings(SettingsPage::default()),
@@ -1512,6 +1618,25 @@ impl Tessella {
         }
     }
 
+    /// A program in a pane asked to set the clipboard (OSC 52), which is how one on
+    /// another machine reaches this Mac's clipboard. Anything a pane prints can carry
+    /// this, so it follows tuios's appearance.selection.osc52_write, with "focused" as
+    /// the default. Tessella has no way to ask, so a pane that would be asked is refused.
+    fn pane_copied(&mut self, pty: &str, text: String, cx: &mut Context<Self>) {
+        let Some(win) = self.state.windows.iter().find(|w| w.pty == pty) else { return };
+        let (name, focused) = (win.label(), win.id == self.state.focused);
+        if text.is_empty() || self.osc52_write == "off" {
+            return;
+        }
+        if self.osc52_write == "on" || (self.osc52_write == "focused" && focused) {
+            let count = text.chars().count();
+            self.write_clipboard(text, cx);
+            self.status = Some(format!("{name} copied {count} characters."));
+        } else {
+            self.status = Some(format!("{name} tried to copy to the clipboard. Only the focused pane can."));
+        }
+    }
+
     fn read_clipboard(&self, cx: &mut Context<Self>) -> Option<String> {
         match Self::test_clipboard() {
             Some(path) => std::fs::read_to_string(path).ok(),
@@ -1527,14 +1652,49 @@ impl Tessella {
         }
     }
 
+    /// An image on the clipboard with no text, which a text paste could not carry.
+    fn clipboard_image(&self, cx: &mut Context<Self>) -> Option<(Vec<u8>, &'static str)> {
+        if let Some(path) = std::env::var_os("TESSELLA_TEST_CLIPBOARD_IMAGE") {
+            return std::fs::read(path).ok().map(|bytes| (bytes, "png"));
+        }
+        if Self::test_clipboard().is_some() {
+            return None;
+        }
+        cx.read_from_clipboard()?.entries().iter().find_map(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => {
+                let extension = match image.format {
+                    gpui::ImageFormat::Png => "png",
+                    gpui::ImageFormat::Jpeg => "jpg",
+                    gpui::ImageFormat::Gif => "gif",
+                    gpui::ImageFormat::Webp => "webp",
+                    gpui::ImageFormat::Bmp => "bmp",
+                    gpui::ImageFormat::Tiff => "tiff",
+                    gpui::ImageFormat::Svg => "svg",
+                };
+                Some((image.bytes.clone(), extension))
+            }
+            _ => None,
+        })
+    }
+
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = self.read_clipboard(cx) else { return };
+        let Some(text) = self.read_clipboard(cx) else {
+            if let Some((bytes, extension)) = self.clipboard_image(cx) {
+                self.paste_image(&bytes, extension);
+            }
+            return;
+        };
         let Some(pty) = self.focused_pty() else { return };
-        let bracketed = self.panes.get(&pty).is_some_and(Pane::bracketed_paste);
+        self.paste_text(&pty, &text);
+    }
+
+    /// Types text into a pane as a paste.
+    fn paste_text(&mut self, pty: &str, text: &str) {
+        let bracketed = self.panes.get(pty).is_some_and(Pane::bracketed_paste);
         // A pasted newline is a carriage return to a terminal program.
         let body = text.replace("\r\n", "\r").replace('\n', "\r");
         let bytes = if bracketed { format!("\x1b[200~{body}\x1b[201~") } else { body };
-        if let Err(err) = self.writer.input(&pty, bytes.as_bytes()) {
+        if let Err(err) = self.writer.input(pty, bytes.as_bytes()) {
             self.status = Some(format!("Could not paste: {err}"));
         }
     }
@@ -1660,7 +1820,9 @@ impl Tessella {
                 self.rail_focused = false;
             }
             Row::Terminal { id, .. } => {
+                let previous = self.state.focused.clone();
                 self.send(json!({"cmd": "focus", "window": id}));
+                self.reveal_if_cut_off(&id, &previous);
                 self.rail_focused = false;
             }
             Row::Agent { window, session, .. } => {
@@ -1694,12 +1856,17 @@ impl Tessella {
 
     /// Opens a file in a new pane, in the person's editor on the file's machine.
     fn edit_file(&mut self, place: tessella::files::Place) {
+        self.edit_file_at(place, None);
+    }
+
+    /// As `edit_file`, at a line for the editors known to take `+N`.
+    fn edit_file_at(&mut self, place: tessella::files::Place, line: Option<u32>) {
         let session = self.state.session.clone();
         let name = place.name();
         let path = place.path.to_string_lossy().into_owned();
         let workspace = self.state.workspace;
         let mut params = json!({"session": session, "name": name, "workspace": workspace, "focus": true,
-            "command": ["sh", "-c", "exec ${EDITOR:-vi} \"$0\"", path]});
+            "command": ["sh", "-c", EDIT_SCRIPT, path, line.map_or(String::new(), |n| n.to_string())]});
         if !place.is_here() {
             params["host"] = json!(place.host);
             // This machine's folders need not exist there.
@@ -2038,17 +2205,23 @@ impl Tessella {
 
     /// Slots follow the size the daemon gives the session, which is what the
     /// panes are laid out in, and stretch so the cards always fill the stage.
-    fn slots(&self, window: &Window) -> Slots {
-        let (w, h) = stage_size(window, ui(self.rail_drawn()));
+    /// The columns and rows of the layout that the stage shows.
+    fn layout_cells(&self) -> (i32, i32) {
         let b = self.state.layout_box();
         let (cols, rows) = if b.w > 0 && b.h > 0 { (b.w, b.h) } else { (self.grid.0 as i32, self.grid.1 as i32) };
         // With no tree anywhere, the box is the whole session: chrome tuios keeps out
         // of it is still kept out, and panes are laid out without it.
-        let (cols, rows) = if self.state.trees.is_empty() {
+        if self.state.trees.is_empty() {
             ((cols - self.unused_chrome.0 as i32).max(1), (rows - self.unused_chrome.1 as i32).max(1))
         } else {
             (cols, rows)
-        };
+        }
+    }
+
+    fn slots(&self, window: &Window) -> Slots {
+        let (w, h) = stage_size(window, ui(self.rail_drawn()));
+        let b = self.state.layout_box();
+        let (cols, rows) = self.layout_cells();
         let gap = self.layout_gap;
         Slots { w: w / (cols.max(1) + gap) as f32, h: h / (rows.max(1) + gap) as f32, x: b.x, y: b.y, gap }
     }
@@ -2135,6 +2308,7 @@ impl Tessella {
             gap: self.layout_gap,
             chrome: self.unused_chrome,
             border: self.pane_border,
+            diff_side_by_side: self.diff_side_by_side,
         };
         if self.state_saved.as_ref() == Some(&state) {
             self.state_save_due = None;
@@ -2352,6 +2526,11 @@ impl Tessella {
                 let _ = line.paint(pos, m.cell_h, window, cx);
             }
         }
+        for (row, first, end) in &p.link {
+            let pos = at(*first, *row);
+            let bar = Bounds::new(point(pos.x, pos.y + m.cell_h - px(1.5)), size(m.cell_w * (end - first) as f32, px(1.0)));
+            window.paint_quad(fill(bar, rgb(t.accent_text)));
+        }
         });
 
         if let Some((thumb_top, thumb_height)) = p.scrollbar {
@@ -2508,9 +2687,11 @@ impl Render for Tessella {
         self.save_window_state(window, cx);
         self.refresh_docs(cx);
         self.refresh_remote_agents(cx);
+        self.refresh_review(cx);
         self.measure_border(cx);
         self.sync_grid(m, window, cx);
         self.refresh_files();
+        self.send_notices(window);
         let slots = self.slots(window);
         if self.slide.is_some_and(|s| self.progress(s.started) >= 1.0) {
             self.slide = None;
@@ -2555,6 +2736,7 @@ impl Render for Tessella {
                 dx: if w.workspace == self.state.workspace { new_dx } else { old_dx },
                 rect: self.drawn_rect(w),
                 scrollbar: self.panes.get(&w.pty).and_then(Pane::scrollbar).filter(|_| w.markdown_place().is_none()),
+                link: self.link_hover.as_ref().filter(|h| h.pty == w.pty).map_or(Vec::new(), |h| h.cells.clone()),
                 doc: self.doc_draw(&w.id),
                 badge: labels.iter().position(|id| *id == w.id).map(|i| i + 1),
                 fit: self.fit_for(w, slots, m),
@@ -2583,6 +2765,7 @@ impl Render for Tessella {
             .font_weight(body_weight(window.scale_factor()))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers))
             .on_mouse_move(cx.listener(Self::on_root_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_release))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_root_release))
@@ -2605,6 +2788,10 @@ impl Render for Tessella {
                             .on_mouse_down(MouseButton::Middle, cx.listener(|this, e: &MouseDownEvent, w, _| this.on_stage_other_press(1, e.position, true, w)))
                             .on_mouse_up(MouseButton::Middle, cx.listener(|this, e: &MouseUpEvent, w, _| this.on_stage_other_press(1, e.position, false, w)))
                             .on_mouse_move(cx.listener(Self::on_stage_move))
+                            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                                this.drop_paths(paths.paths().to_vec(), window);
+                                cx.notify();
+                            }))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_stage_release))
                             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_stage_release))
                             .on_scroll_wheel(cx.listener(Self::on_stage_wheel))
@@ -2642,6 +2829,9 @@ impl Render for Tessella {
 }
 
 fn main() {
+    if tessella::notify::is_bundled() {
+        tessella::notify::adopt_login_environment();
+    }
     let target = match parse_args() {
         Ok(target) => target,
         Err(e) => {

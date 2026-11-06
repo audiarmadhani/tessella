@@ -226,6 +226,7 @@ impl Keymap {
         let mut own = vec![
             ("cmd+n".to_string(), "tessella_new_pane".to_string()),
             ("shift+cmd+t".to_string(), "tessella_themes".to_string()),
+            ("shift+cmd+d".to_string(), "tessella_review".to_string()),
             ("cmd+,".to_string(), "tessella_settings".to_string()),
         ];
         own.extend((1..=9).map(|n| (format!("cmd+{n}"), format!("switch_workspace_{n}"))));

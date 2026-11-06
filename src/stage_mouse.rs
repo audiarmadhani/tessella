@@ -61,6 +61,8 @@ impl DropSide {
 
 /// How many points from a split line or the card's edge still count as on it.
 const REACH: f32 = 5.0;
+/// How many points a press can move and still be a click.
+const CLICK_SLOP: f32 = 4.0;
 /// The width of the strip at a card's right edge that is the scrollbar.
 const SCROLLBAR: f32 = 9.0;
 
@@ -115,6 +117,7 @@ impl Tessella {
             return cx.notify();
         }
         if let Some(win) = self.window_under(event.position, window).cloned() {
+            self.click_reveal = Some((win.id.clone(), event.position, self.state.focused.clone()));
             self.send(json!({"cmd": "focus", "window": win.id}));
             let (col, row, side, past) = self.cell_at(&win, event.position, window);
             if past < 0 {
@@ -124,6 +127,14 @@ impl Tessella {
             if win.markdown_place().is_some() {
                 self.click_doc(&win.id, event.position, cx);
                 return cx.notify();
+            }
+            // Cmd-click opens a link, even in a program that asked for the mouse.
+            if event.modifiers.platform {
+                if let Some(found) = self.panes.get(&win.pty).and_then(|p| if past == 0 { p.link_under(col, row) } else { None }) {
+                    self.link_hover = None;
+                    self.open_link(&win, found.link, cx);
+                    return cx.notify();
+                }
             }
             if self.on_scrollbar(&win, event.position, window) {
                 self.scroll_to_pointer(&win, event.position, window);
@@ -217,9 +228,12 @@ impl Tessella {
 
     /// With no button down: the pointer's shape, and motion to a program that follows it.
     fn hover_stage(&mut self, event: &MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        self.pointer = Some(event.position);
+        let on_link = self.hover_link(event.position, event.modifiers, window, cx);
         let cursor = match self.split_under(event.position, window) {
             Some(hit) if hit.along_x => CursorStyle::ResizeLeftRight,
             Some(_) => CursorStyle::ResizeUpDown,
+            None if on_link => CursorStyle::PointingHand,
             None => CursorStyle::Arrow,
         };
         if cursor != self.stage_cursor {
@@ -268,6 +282,14 @@ impl Tessella {
     }
 
     pub(super) fn on_stage_release(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Only now, and only for a press that stayed put. A pane moving under the pointer
+        // would spoil a drag or a selection, but a hand always moves a little in a click.
+        if let Some((id, at, previous)) = self.click_reveal.take() {
+            let moved = f32::from(event.position.x - at.x).abs().max(f32::from(event.position.y - at.y).abs());
+            if moved <= CLICK_SLOP {
+                self.reveal_if_cut_off(&id, &previous);
+            }
+        }
         if let Some(StageDrag::Pane { id, drop: Some((target, side)), .. }) = self.stage_drag.take() {
             if side == DropSide::Swap {
                 self.send(json!({"cmd": "layout", "op": "swap", "a": id, "b": target}));

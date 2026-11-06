@@ -214,7 +214,8 @@ fn encode(text: &str) -> String {
     out
 }
 
-fn decode(text: &str) -> Option<String> {
+/// Reads the `%20` kind of escape in an address.
+pub fn decode(text: &str) -> Option<String> {
     let encoded = text.as_bytes();
     let mut bytes = Vec::with_capacity(encoded.len());
     let mut at = 0;

@@ -34,6 +34,10 @@ pub const TEMPLATE: &str = r#"# Tessella settings. Every line is optional: delet
 # Listed first in the theme picker. Star them there.
 # favourites = ["tokyonight", "dracula"]
 
+[notifications]
+# enabled = true
+# done = true   # Also when an agent finishes.
+
 [keys]
 # Changes the prefix in Tessella only.
 # leader = "ctrl+a"
@@ -139,6 +143,22 @@ pub struct Settings {
     pub animation: AnimationSettings,
     pub theme: ThemeSettings,
     pub keys: KeySettings,
+    pub notifications: NotificationSettings,
+}
+
+/// Mac notifications when an agent needs the person.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationSettings {
+    pub enabled: bool,
+    /// Also when an agent finishes, not only when it needs an answer or fails.
+    pub done: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self { enabled: true, done: true }
+    }
 }
 
 impl Default for KeySettings {
